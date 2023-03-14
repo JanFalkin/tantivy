@@ -34,10 +34,11 @@ pub use query_grammar::Occur;
 
 /// set_k_and_b
 /// enables modification of previous constants in bm25
-#[no_mangle]
-pub unsafe extern "C" fn set_k_and_b(k:f32, b:f32){
-    crate::query::bm25::K1 = k;
-    crate::query::bm25::B = b;
+pub fn do_set_k_and_b(k:f32, b:f32){
+    unsafe{
+        crate::query::bm25::K1 = k;
+        crate::query::bm25::B = b;
+    }
 }
 
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
@@ -80,6 +81,14 @@ mod tests {
     use crate::query::QueryParser;
     use crate::schema::{Schema, TEXT};
     use crate::{Index, Term};
+    use crate::query::do_set_k_and_b;
+
+    #[test]
+    fn test_set_kb() {
+        do_set_k_and_b(1.0,1.0);
+        do_set_k_and_b(1.2,0.75);
+    }
+
 
     #[test]
     fn test_query_terms() {
