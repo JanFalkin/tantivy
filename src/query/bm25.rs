@@ -5,15 +5,8 @@ use crate::query::Explanation;
 use crate::schema::Field;
 use crate::{Score, Searcher, Term};
 
-static mut K1: Score = 1.2;
-static mut B: Score = 0.75;
-
-
-#[no_mangle]
-pub unsafe extern "C" fn SetKandB(k:f32, b:f32){
-    K1 = k;
-    B = b;
-}
+pub static mut K1: Score = 1.2;
+pub static mut B: Score = 0.75;
 
 /// An interface to compute the statistics needed in BM25 scoring.
 ///

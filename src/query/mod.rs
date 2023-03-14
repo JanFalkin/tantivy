@@ -31,6 +31,15 @@ mod vec_docset;
 pub(crate) mod score_combiner;
 pub use query_grammar::Occur;
 
+
+/// set_k_and_b
+/// enables modification of previous constants in bm25
+#[no_mangle]
+pub unsafe extern "C" fn set_k_and_b(k:f32, b:f32){
+    crate::query::bm25::K1 = k;
+    crate::query::bm25::B = b;
+}
+
 pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
 pub use self::bitset::BitSetDocSet;
