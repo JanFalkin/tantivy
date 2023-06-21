@@ -139,6 +139,16 @@ impl OwnedBytes {
         self.advance(8);
         u64::from_le_bytes(octlet)
     }
+
+    /// Reads an `u32` encoded as little-endian from the `OwnedBytes` and advance by 4 bytes.
+    #[inline]
+    pub fn read_u32(&mut self) -> u32 {
+        assert!(self.len() > 3);
+
+        let quad: [u8; 4] = self.as_slice()[..4].try_into().unwrap();
+        self.advance(4);
+        u32::from_le_bytes(quad)
+    }
 }
 
 impl fmt::Debug for OwnedBytes {
@@ -150,7 +160,7 @@ impl fmt::Debug for OwnedBytes {
         } else {
             self.as_slice()
         };
-        write!(f, "OwnedBytes({:?}, len={})", bytes_truncated, self.len())
+        write!(f, "OwnedBytes({bytes_truncated:?}, len={})", self.len())
     }
 }
 
@@ -249,12 +259,12 @@ mod tests {
     fn test_owned_bytes_debug() {
         let short_bytes = OwnedBytes::new(b"abcd".as_ref());
         assert_eq!(
-            format!("{:?}", short_bytes),
+            format!("{short_bytes:?}"),
             "OwnedBytes([97, 98, 99, 100], len=4)"
         );
         let long_bytes = OwnedBytes::new(b"abcdefghijklmnopq".as_ref());
         assert_eq!(
-            format!("{:?}", long_bytes),
+            format!("{long_bytes:?}"),
             "OwnedBytes([97, 98, 99, 100, 101, 102, 103, 104, 105, 106], len=17)"
         );
     }

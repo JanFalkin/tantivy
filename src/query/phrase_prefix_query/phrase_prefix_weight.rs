@@ -78,8 +78,11 @@ impl PhrasePrefixWeight {
         }
 
         let inv_index = reader.inverted_index(self.prefix.1.field())?;
-        let mut stream = inv_index.terms().range().ge(self.prefix.1.value_bytes());
-        if let Some(end) = prefix_end(self.prefix.1.value_bytes()) {
+        let mut stream = inv_index
+            .terms()
+            .range()
+            .ge(self.prefix.1.serialized_value_bytes());
+        if let Some(end) = prefix_end(self.prefix.1.serialized_value_bytes()) {
             stream = stream.lt(&end);
         }
 
@@ -252,6 +255,24 @@ mod tests {
         assert_eq!(phrase_scorer.doc(), 1);
         assert_eq!(phrase_scorer.advance(), 2);
         assert_eq!(phrase_scorer.doc(), 2);
+        assert_eq!(phrase_scorer.advance(), TERMINATED);
+        Ok(())
+    }
+
+    #[test]
+    pub fn test_phrase_no_match() -> crate::Result<()> {
+        let index = create_index(&["aa dd", "aa aa bb c dd aa bb cc aa dc", " aa bb cd"])?;
+        let schema = index.schema();
+        let text_field = schema.get_field("text").unwrap();
+        let searcher = index.reader()?.searcher();
+        let phrase_query = PhrasePrefixQuery::new(vec![
+            Term::from_field_text(text_field, "aa"),
+            Term::from_field_text(text_field, "cc"),
+            Term::from_field_text(text_field, "d"),
+        ]);
+        let enable_scoring = EnableScoring::enabled_from_searcher(&searcher);
+        let weight = phrase_query.weight(enable_scoring).unwrap();
+        let mut phrase_scorer = weight.scorer(searcher.segment_reader(0u32), 1.0)?;
         assert_eq!(phrase_scorer.advance(), TERMINATED);
         Ok(())
     }

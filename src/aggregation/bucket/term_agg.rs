@@ -1,21 +1,22 @@
 use std::fmt::Debug;
 
-use columnar::{Cardinality, ColumnType};
+use columnar::ColumnType;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use super::{CustomOrder, Order, OrderTarget};
+use crate::aggregation::agg_limits::MemoryConsumption;
 use crate::aggregation::agg_req_with_accessor::{
-    AggregationsWithAccessor, BucketAggregationWithAccessor,
+    AggregationWithAccessor, AggregationsWithAccessor,
 };
+use crate::aggregation::f64_from_fastfield_u64;
 use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResults, IntermediateBucketResult, IntermediateTermBucketEntry,
-    IntermediateTermBucketResult,
+    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
+    IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
 };
 use crate::aggregation::segment_agg_result::{
     build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{f64_from_fastfield_u64, Key, VecWithNames};
 use crate::error::DataCorruption;
 use crate::TantivyError;
 
@@ -28,10 +29,6 @@ use crate::TantivyError;
 /// ## Prerequisite
 /// Term aggregations work only on [fast fields](`crate::fastfield`) of type `u64`, `f64`, `i64` and
 /// text.
-///
-/// ### Terminology
-/// Shard parameters are supposed to be equivalent to elasticsearch shard parameter.
-/// Since they are
 ///
 /// ## Document count error
 /// To improve performance, results from one segment are cut off at `segment_size`. On a index with
@@ -53,7 +50,7 @@ use crate::TantivyError;
 /// into segment_size.
 ///
 /// Result type is [`BucketResult`](crate::aggregation::agg_result::BucketResult) with
-/// [`TermBucketEntry`](crate::aggregation::agg_result::BucketEntry) on the
+/// [`BucketEntry`](crate::aggregation::agg_result::BucketEntry) on the
 /// `AggregationCollector`.
 ///
 /// Result type is
@@ -205,55 +202,129 @@ impl TermsAggregationInternal {
 #[derive(Clone, Debug, Default)]
 /// Container to store term_ids/or u64 values and their buckets.
 struct TermBuckets {
-    pub(crate) entries: FxHashMap<u64, u64>,
+    pub(crate) entries: FxHashMap<u64, u32>,
     pub(crate) sub_aggs: FxHashMap<u64, Box<dyn SegmentAggregationCollector>>,
 }
 
-#[derive(Clone, Default)]
-struct TermBucketEntry {
-    doc_count: u64,
-    sub_aggregations: Option<Box<dyn SegmentAggregationCollector>>,
-}
-
-impl Debug for TermBucketEntry {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("TermBucketEntry")
-            .field("doc_count", &self.doc_count)
-            .finish()
-    }
-}
-
-impl TermBucketEntry {
-    fn from_blueprint(blueprint: &Option<Box<dyn SegmentAggregationCollector>>) -> Self {
-        Self {
-            doc_count: 0,
-            sub_aggregations: blueprint.clone(),
-        }
-    }
-
-    pub(crate) fn into_intermediate_bucket_entry(
-        self,
-        agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateTermBucketEntry> {
-        let sub_aggregation = if let Some(sub_aggregation) = self.sub_aggregations {
-            sub_aggregation.into_intermediate_aggregations_result(agg_with_accessor)?
-        } else {
-            Default::default()
-        };
-
-        Ok(IntermediateTermBucketEntry {
-            doc_count: self.doc_count,
-            sub_aggregation,
-        })
-    }
-}
-
 impl TermBuckets {
-    fn force_flush(&mut self, agg_with_accessor: &AggregationsWithAccessor) -> crate::Result<()> {
+    fn get_memory_consumption(&self) -> usize {
+        let sub_aggs_mem = self.sub_aggs.memory_consumption();
+        let buckets_mem = self.entries.memory_consumption();
+        sub_aggs_mem + buckets_mem
+    }
+
+    fn force_flush(
+        &mut self,
+        agg_with_accessor: &mut AggregationsWithAccessor,
+    ) -> crate::Result<()> {
         for sub_aggregations in &mut self.sub_aggs.values_mut() {
             sub_aggregations.as_mut().flush(agg_with_accessor)?;
         }
         Ok(())
+    }
+}
+
+/// The composite collector is used, when we have different types under one field, to support a term
+/// aggregation on both.
+#[derive(Clone, Debug)]
+pub struct SegmentTermCollectorComposite {
+    term_agg1: SegmentTermCollector, // field type 1, e.g. strings
+    term_agg2: SegmentTermCollector, // field type 2, e.g. u64
+    accessor_idx: usize,
+}
+impl SegmentAggregationCollector for SegmentTermCollectorComposite {
+    fn add_intermediate_aggregation_result(
+        self: Box<Self>,
+        agg_with_accessor: &AggregationsWithAccessor,
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
+        let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
+
+        let bucket = self
+            .term_agg1
+            .into_intermediate_bucket_result(agg_with_accessor)?;
+        results.push(
+            name.to_string(),
+            IntermediateAggregationResult::Bucket(bucket),
+        )?;
+        let bucket = self
+            .term_agg2
+            .into_intermediate_bucket_result(agg_with_accessor)?;
+        results.push(name, IntermediateAggregationResult::Bucket(bucket))?;
+
+        Ok(())
+    }
+
+    #[inline]
+    fn collect(
+        &mut self,
+        doc: crate::DocId,
+        agg_with_accessor: &mut AggregationsWithAccessor,
+    ) -> crate::Result<()> {
+        self.term_agg1.collect_block(&[doc], agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+        self.term_agg2.collect_block(&[doc], agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+        Ok(())
+    }
+
+    #[inline]
+    fn collect_block(
+        &mut self,
+        docs: &[crate::DocId],
+        agg_with_accessor: &mut AggregationsWithAccessor,
+    ) -> crate::Result<()> {
+        self.term_agg1.collect_block(docs, agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+        self.term_agg2.collect_block(docs, agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+
+        Ok(())
+    }
+
+    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
+        self.term_agg1.flush(agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+        self.term_agg2.flush(agg_with_accessor)?;
+        self.swap_accessor(&mut agg_with_accessor.aggs.values[self.accessor_idx]);
+
+        Ok(())
+    }
+}
+
+impl SegmentTermCollectorComposite {
+    /// Swaps the accessor and field type with the second accessor and field type.
+    /// This way we can use the same code for both aggregations.
+    fn swap_accessor(&self, aggregations: &mut AggregationWithAccessor) {
+        if let Some(accessor) = aggregations.accessor2.as_mut() {
+            std::mem::swap(&mut accessor.0, &mut aggregations.accessor);
+            std::mem::swap(&mut accessor.1, &mut aggregations.field_type);
+        }
+    }
+
+    pub(crate) fn from_req_and_validate(
+        req: &TermsAggregation,
+        sub_aggregations: &mut AggregationsWithAccessor,
+        field_type: ColumnType,
+        field_type2: ColumnType,
+        accessor_idx: usize,
+    ) -> crate::Result<Self> {
+        Ok(Self {
+            term_agg1: SegmentTermCollector::from_req_and_validate(
+                req,
+                sub_aggregations,
+                field_type,
+                accessor_idx,
+            )?,
+            term_agg2: SegmentTermCollector::from_req_and_validate(
+                req,
+                sub_aggregations,
+                field_type2,
+                accessor_idx,
+            )?,
+            accessor_idx,
+        })
     }
 }
 
@@ -267,7 +338,6 @@ pub struct SegmentTermCollector {
     blueprint: Option<Box<dyn SegmentAggregationCollector>>,
     field_type: ColumnType,
     accessor_idx: usize,
-    val_cache: Vec<u64>,
 }
 
 pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
@@ -276,27 +346,25 @@ pub(crate) fn get_agg_name_and_property(name: &str) -> (&str, &str) {
 }
 
 impl SegmentAggregationCollector for SegmentTermCollector {
-    fn into_intermediate_aggregations_result(
+    fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateAggregationResults> {
-        let name = agg_with_accessor.buckets.keys[self.accessor_idx].to_string();
-        let agg_with_accessor = &agg_with_accessor.buckets.values[self.accessor_idx];
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
+        let agg_with_accessor = &agg_with_accessor.aggs.values[self.accessor_idx];
 
         let bucket = self.into_intermediate_bucket_result(agg_with_accessor)?;
-        let buckets = Some(VecWithNames::from_entries(vec![(name, bucket)]));
+        results.push(name, IntermediateAggregationResult::Bucket(bucket))?;
 
-        Ok(IntermediateAggregationResults {
-            metrics: None,
-            buckets,
-        })
+        Ok(())
     }
 
     #[inline]
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
         self.collect_block(&[doc], agg_with_accessor)
     }
@@ -305,53 +373,42 @@ impl SegmentAggregationCollector for SegmentTermCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        let accessor = &agg_with_accessor.buckets.values[self.accessor_idx].accessor;
-        let sub_aggregation_accessor =
-            &agg_with_accessor.buckets.values[self.accessor_idx].sub_aggregation;
+        let bucket_agg_accessor = &mut agg_with_accessor.aggs.values[self.accessor_idx];
 
-        if accessor.get_cardinality() == Cardinality::Full {
-            self.val_cache.resize(docs.len(), 0);
-            accessor.values.get_vals(docs, &mut self.val_cache);
-            for (doc, term_id) in docs.iter().zip(self.val_cache.iter().cloned()) {
-                let entry = self.term_buckets.entries.entry(term_id).or_default();
-                *entry += 1;
-            }
-            // has subagg
-            if let Some(blueprint) = self.blueprint.as_ref() {
-                for (doc, term_id) in docs.iter().zip(self.val_cache.iter().cloned()) {
-                    let sub_aggregations = self
-                        .term_buckets
-                        .sub_aggs
-                        .entry(term_id)
-                        .or_insert_with(|| blueprint.clone());
-                    sub_aggregations.collect(*doc, sub_aggregation_accessor)?;
-                }
-            }
-        } else {
-            for doc in docs {
-                for term_id in accessor.values_for_doc(*doc) {
-                    let entry = self.term_buckets.entries.entry(term_id).or_default();
-                    *entry += 1;
-                    // TODO: check if seperate loop is faster (may depend on the codec)
-                    if let Some(blueprint) = self.blueprint.as_ref() {
-                        let sub_aggregations = self
-                            .term_buckets
-                            .sub_aggs
-                            .entry(term_id)
-                            .or_insert_with(|| blueprint.clone());
-                        sub_aggregations.collect(*doc, sub_aggregation_accessor)?;
-                    }
-                }
+        let mem_pre = self.get_memory_consumption();
+
+        bucket_agg_accessor
+            .column_block_accessor
+            .fetch_block(docs, &bucket_agg_accessor.accessor);
+        for term_id in bucket_agg_accessor.column_block_accessor.iter_vals() {
+            let entry = self.term_buckets.entries.entry(term_id).or_default();
+            *entry += 1;
+        }
+        // has subagg
+        if let Some(blueprint) = self.blueprint.as_ref() {
+            for (doc, term_id) in bucket_agg_accessor.column_block_accessor.iter_docid_vals() {
+                let sub_aggregations = self
+                    .term_buckets
+                    .sub_aggs
+                    .entry(term_id)
+                    .or_insert_with(|| blueprint.clone());
+                sub_aggregations.collect(doc, &mut bucket_agg_accessor.sub_aggregation)?;
             }
         }
+
+        let mem_delta = self.get_memory_consumption() - mem_pre;
+        bucket_agg_accessor
+            .limits
+            .add_memory_consumed(mem_delta as u64)?;
+
         Ok(())
     }
 
-    fn flush(&mut self, agg_with_accessor: &AggregationsWithAccessor) -> crate::Result<()> {
+    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
         let sub_aggregation_accessor =
-            &agg_with_accessor.buckets.values[self.accessor_idx].sub_aggregation;
+            &mut agg_with_accessor.aggs.values[self.accessor_idx].sub_aggregation;
 
         self.term_buckets.force_flush(sub_aggregation_accessor)?;
         Ok(())
@@ -359,12 +416,24 @@ impl SegmentAggregationCollector for SegmentTermCollector {
 }
 
 impl SegmentTermCollector {
+    fn get_memory_consumption(&self) -> usize {
+        let self_mem = std::mem::size_of::<Self>();
+        let term_buckets_mem = self.term_buckets.get_memory_consumption();
+        self_mem + term_buckets_mem
+    }
+
     pub(crate) fn from_req_and_validate(
         req: &TermsAggregation,
-        sub_aggregations: &AggregationsWithAccessor,
+        sub_aggregations: &mut AggregationsWithAccessor,
         field_type: ColumnType,
         accessor_idx: usize,
     ) -> crate::Result<Self> {
+        if field_type == ColumnType::Bytes || field_type == ColumnType::Bool {
+            return Err(TantivyError::InvalidArgument(format!(
+                "terms aggregation is not supported for column type {:?}",
+                field_type
+            )));
+        }
         let term_buckets = TermBuckets::default();
 
         if let Some(custom_order) = req.order.as_ref() {
@@ -372,10 +441,10 @@ impl SegmentTermCollector {
             if let OrderTarget::SubAggregation(sub_agg_name) = &custom_order.target {
                 let (agg_name, _agg_property) = get_agg_name_and_property(sub_agg_name);
 
-                sub_aggregations.metrics.get(agg_name).ok_or_else(|| {
+                sub_aggregations.aggs.get(agg_name).ok_or_else(|| {
                     TantivyError::InvalidArgument(format!(
-                        "could not find aggregation with name {} in metric sub_aggregations",
-                        agg_name
+                        "could not find aggregation with name {agg_name} in metric \
+                         sub_aggregations"
                     ))
                 })?;
             }
@@ -395,16 +464,15 @@ impl SegmentTermCollector {
             blueprint,
             field_type,
             accessor_idx,
-            val_cache: Default::default(),
         })
     }
 
     #[inline]
     pub(crate) fn into_intermediate_bucket_result(
         mut self,
-        agg_with_accessor: &BucketAggregationWithAccessor,
+        agg_with_accessor: &AggregationWithAccessor,
     ) -> crate::Result<IntermediateBucketResult> {
-        let mut entries: Vec<(u64, u64)> = self.term_buckets.entries.into_iter().collect();
+        let mut entries: Vec<(u64, u32)> = self.term_buckets.entries.into_iter().collect();
 
         let order_by_sub_aggregation =
             matches!(self.req.order.target, OrderTarget::SubAggregation(_));
@@ -440,25 +508,27 @@ impl SegmentTermCollector {
             cut_off_buckets(&mut entries, self.req.segment_size as usize)
         };
 
-        let mut dict: FxHashMap<Key, IntermediateTermBucketEntry> = Default::default();
+        let mut dict: FxHashMap<IntermediateKey, IntermediateTermBucketEntry> = Default::default();
         dict.reserve(entries.len());
 
         let mut into_intermediate_bucket_entry =
             |id, doc_count| -> crate::Result<IntermediateTermBucketEntry> {
-                let intermediate_entry = if let Some(blueprint) = self.blueprint.as_ref() {
+                let intermediate_entry = if self.blueprint.as_ref().is_some() {
+                    let mut sub_aggregation_res = IntermediateAggregationResults::default();
+                    self.term_buckets
+                        .sub_aggs
+                        .remove(&id)
+                        .unwrap_or_else(|| {
+                            panic!("Internal Error: could not find subaggregation for id {id}")
+                        })
+                        .add_intermediate_aggregation_result(
+                            &agg_with_accessor.sub_aggregation,
+                            &mut sub_aggregation_res,
+                        )?;
+
                     IntermediateTermBucketEntry {
                         doc_count,
-                        sub_aggregation: self
-                            .term_buckets
-                            .sub_aggs
-                            .remove(&id)
-                            .expect(&format!(
-                                "Internal Error: could not find subaggregation for id {}",
-                                id
-                            ))
-                            .into_intermediate_aggregations_result(
-                                &agg_with_accessor.sub_aggregation,
-                            )?,
+                        sub_aggregation: sub_aggregation_res,
                     }
                 } else {
                     IntermediateTermBucketEntry {
@@ -479,36 +549,43 @@ impl SegmentTermCollector {
             for (term_id, doc_count) in entries {
                 if !term_dict.ord_to_str(term_id, &mut buffer)? {
                     return Err(TantivyError::InternalError(format!(
-                        "Couldn't find term_id {} in dict",
-                        term_id
+                        "Couldn't find term_id {term_id} in dict"
                     )));
                 }
 
                 let intermediate_entry = into_intermediate_bucket_entry(term_id, doc_count)?;
 
-                dict.insert(Key::Str(buffer.to_string()), intermediate_entry);
+                dict.insert(IntermediateKey::Str(buffer.to_string()), intermediate_entry);
             }
             if self.req.min_doc_count == 0 {
                 // TODO: Handle rev streaming for descending sorting by keys
                 let mut stream = term_dict.dictionary().stream()?;
+                let empty_sub_aggregation = IntermediateAggregationResults::empty_from_req(
+                    agg_with_accessor.agg.sub_aggregation(),
+                );
                 while let Some((key, _ord)) = stream.next() {
                     if dict.len() >= self.req.segment_size as usize {
                         break;
                     }
 
-                    let key = Key::Str(
+                    let key = IntermediateKey::Str(
                         std::str::from_utf8(key)
                             .map_err(|utf8_err| DataCorruption::comment_only(utf8_err.to_string()))?
                             .to_string(),
                     );
-                    dict.entry(key).or_default();
+
+                    dict.entry(key.clone())
+                        .or_insert_with(|| IntermediateTermBucketEntry {
+                            doc_count: 0,
+                            sub_aggregation: empty_sub_aggregation.clone(),
+                        });
                 }
             }
         } else {
             for (val, doc_count) in entries {
                 let intermediate_entry = into_intermediate_bucket_entry(val, doc_count)?;
                 let val = f64_from_fastfield_u64(val, &self.field_type);
-                dict.insert(Key::F64(val), intermediate_entry);
+                dict.insert(IntermediateKey::F64(val), intermediate_entry);
             }
         };
 
@@ -525,24 +602,14 @@ impl SegmentTermCollector {
 pub(crate) trait GetDocCount {
     fn doc_count(&self) -> u64;
 }
-impl GetDocCount for (u32, TermBucketEntry) {
+impl GetDocCount for (u64, u32) {
     fn doc_count(&self) -> u64 {
-        self.1.doc_count
-    }
-}
-impl GetDocCount for (u64, u64) {
-    fn doc_count(&self) -> u64 {
-        self.1
-    }
-}
-impl GetDocCount for (u64, TermBucketEntry) {
-    fn doc_count(&self) -> u64 {
-        self.1.doc_count
+        self.1 as u64
     }
 }
 impl GetDocCount for (String, IntermediateTermBucketEntry) {
     fn doc_count(&self) -> u64 {
-        self.1.doc_count
+        self.1.doc_count as u64
     }
 }
 
@@ -566,15 +633,15 @@ pub(crate) fn cut_off_buckets<T: GetDocCount + Debug>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::aggregation::agg_req::{
-        Aggregation, Aggregations, BucketAggregation, BucketAggregationType, MetricAggregation,
-    };
-    use crate::aggregation::metric::{AverageAggregation, StatsAggregation};
+    use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::tests::{
-        exec_request, exec_request_with_query, get_test_index_from_terms,
-        get_test_index_from_values_and_terms,
+        exec_request, exec_request_with_query, exec_request_with_query_and_memory_limit,
+        get_test_index_from_terms, get_test_index_from_values_and_terms,
     };
+    use crate::aggregation::AggregationLimits;
+    use crate::indexer::NoMergePolicy;
+    use crate::schema::{Schema, FAST, STRING};
+    use crate::Index;
 
     #[test]
     fn terms_aggregation_test_single_segment() -> crate::Result<()> {
@@ -597,21 +664,14 @@ mod tests {
         ];
         let index = get_test_index_from_terms(merge_segments, &segment_and_terms)?;
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -622,23 +682,16 @@ mod tests {
         assert_eq!(res["my_texts"]["buckets"][2]["doc_count"], 1);
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        size: Some(2),
-                        split_size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "size": 2,
+                    "segment_size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -652,23 +705,16 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 1);
 
         // test min_doc_count
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        size: Some(2),
-                        min_doc_count: Some(3),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "size": 2,
+                    "min_doc_count": 3,
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -705,43 +751,33 @@ mod tests {
         ];
         let index = get_test_index_from_values_and_terms(merge_segments, &segment_and_terms)?;
 
-        let sub_agg: Aggregations = vec![
-            (
-                "avg_score".to_string(),
-                Aggregation::Metric(MetricAggregation::Average(
-                    AverageAggregation::from_field_name("score".to_string()),
-                )),
-            ),
-            (
-                "stats_score".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                    "score".to_string(),
-                ))),
-            ),
-        ]
-        .into_iter()
-        .collect();
+        let sub_agg: Aggregations = serde_json::from_value(json!({
+            "avg_score": {
+                "avg": {
+                    "field": "score",
+                }
+            },
+            "stats_score": {
+                "stats": {
+                    "field": "score",
+                }
+            }
+        }))
+        .unwrap();
 
         // sub agg desc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::Count,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg.clone(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_count": "asc",
+                    },
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "termb");
@@ -760,61 +796,37 @@ mod tests {
 
         // Agg on non string
         //
-        let agg_req: Aggregations = vec![
-            (
-                "my_scores1".to_string(),
-                Aggregation::Bucket(
-                    BucketAggregation {
-                        bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                            field: "score".to_string(),
-                            order: Some(CustomOrder {
-                                order: Order::Asc,
-                                target: OrderTarget::Count,
-                            }),
-                            ..Default::default()
-                        }),
-                        sub_aggregation: sub_agg.clone(),
-                    }
-                    .into(),
-                ),
-            ),
-            (
-                "my_scores2".to_string(),
-                Aggregation::Bucket(
-                    BucketAggregation {
-                        bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                            field: "score_f64".to_string(),
-                            order: Some(CustomOrder {
-                                order: Order::Asc,
-                                target: OrderTarget::Count,
-                            }),
-                            ..Default::default()
-                        }),
-                        sub_aggregation: sub_agg.clone(),
-                    }
-                    .into(),
-                ),
-            ),
-            (
-                "my_scores3".to_string(),
-                Aggregation::Bucket(
-                    BucketAggregation {
-                        bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                            field: "score_i64".to_string(),
-                            order: Some(CustomOrder {
-                                order: Order::Asc,
-                                target: OrderTarget::Count,
-                            }),
-                            ..Default::default()
-                        }),
-                        sub_aggregation: sub_agg,
-                    }
-                    .into(),
-                ),
-            ),
-        ]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_scores1": {
+                "terms": {
+                    "field": "score",
+                    "order": {
+                        "_count": "asc",
+                    },
+                },
+                "aggs": sub_agg,
+            },
+            "my_scores2": {
+                "terms": {
+                    "field": "score_f64",
+                    "order": {
+                        "_count": "asc",
+                    },
+                },
+                "aggs": sub_agg,
+            },
+            "my_scores3": {
+                "terms": {
+                    "field": "score_i64",
+                    "order": {
+                        "_count": "asc",
+                    },
+                },
+                "aggs": sub_agg,
+            }
+
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_scores1"]["buckets"][0]["key"], 8.0);
@@ -891,43 +903,33 @@ mod tests {
         ];
         let index = get_test_index_from_values_and_terms(merge_segments, &segment_and_terms)?;
 
-        let sub_agg: Aggregations = vec![
-            (
-                "avg_score".to_string(),
-                Aggregation::Metric(MetricAggregation::Average(
-                    AverageAggregation::from_field_name("score".to_string()),
-                )),
-            ),
-            (
-                "stats_score".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                    "score".to_string(),
-                ))),
-            ),
-        ]
-        .into_iter()
-        .collect();
+        let sub_agg: Aggregations = serde_json::from_value(json!({
+            "avg_score": {
+                "avg": {
+                    "field": "score",
+                }
+            },
+            "stats_score": {
+                "stats": {
+                    "field": "score",
+                }
+            }
+        }))
+        .unwrap();
 
         // sub agg desc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Desc,
-                            target: OrderTarget::SubAggregation("avg_score".to_string()),
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg.clone(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "avg_score": "desc"
+                    }
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "termb");
@@ -945,25 +947,19 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // sub agg asc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::SubAggregation("avg_score".to_string()),
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg.clone(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        //
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "avg_score": "asc"
+                    }
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -982,25 +978,18 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // sub agg multi value asc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::SubAggregation("stats_score.avg".to_string()),
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg.clone(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "stats_score.avg": "asc"
+                    }
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1019,25 +1008,18 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // sub agg invalid request
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::SubAggregation("doesnotexist".to_string()),
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: sub_agg,
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "doesnotexist": "asc"
+                    }
+                },
+                "aggs": sub_agg,
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index);
         assert!(res.is_err());
@@ -1069,25 +1051,17 @@ mod tests {
         let index = get_test_index_from_values_and_terms(merge_segments, &segment_and_terms)?;
 
         // key asc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::Key,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "asc"
+                    }
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -1099,26 +1073,18 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // key desc and size cut_off
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::Key,
-                        }),
-                        size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "asc"
+                    },
+                    "size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -1133,27 +1099,19 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 3);
 
         // key asc and segment_size cut_off
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Asc,
-                            target: OrderTarget::Key,
-                        }),
-                        size: Some(2),
-                        segment_size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "asc"
+                    },
+                    "size": 2,
+                    "segment_size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "terma");
@@ -1166,25 +1124,17 @@ mod tests {
         );
 
         // key desc
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Desc,
-                            target: OrderTarget::Key,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "desc"
+                    },
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "termc");
@@ -1196,26 +1146,18 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
 
         // key desc, size cut_off
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Desc,
-                            target: OrderTarget::Key,
-                        }),
-                        size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "desc"
+                    },
+                    "size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "termc");
@@ -1229,27 +1171,19 @@ mod tests {
         assert_eq!(res["my_texts"]["sum_other_doc_count"], 5);
 
         // key desc, segment_size cut_off
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        order: Some(CustomOrder {
-                            order: Order::Desc,
-                            target: OrderTarget::Key,
-                        }),
-                        size: Some(2),
-                        segment_size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "order": {
+                        "_key": "desc"
+                    },
+                    "size": 2,
+                    "segment_size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
         assert_eq!(res["my_texts"]["buckets"][0]["key"], "termc");
@@ -1273,22 +1207,15 @@ mod tests {
 
         let index = get_test_index_from_terms(false, &terms_per_segment)?;
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        min_doc_count: Some(0),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "min_doc_count": 0,
+                },
+            }
+        }))
+        .unwrap();
 
         // searching for terma, but min_doc_count will return all terms
         let res = exec_request_with_query(agg_req, &index, Some(("string_id", "terma")))?;
@@ -1306,6 +1233,85 @@ mod tests {
     }
 
     #[test]
+    fn terms_aggregation_min_doc_count_special_case_with_sub_agg_empty_merge() -> crate::Result<()>
+    {
+        let mut schema_builder = Schema::builder();
+        let string_field_1 = schema_builder.add_text_field("string1", STRING | FAST);
+        let string_field_2 = schema_builder.add_text_field("string2", STRING | FAST);
+        let score_fieldtype = crate::schema::NumericOptions::default().set_fast();
+        let score_field = schema_builder.add_u64_field("score", score_fieldtype);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            // writing the segment
+            index_writer.add_document(doc!(
+                string_field_1 => "A".to_string(),
+                string_field_2 => "hit".to_string(),
+                score_field => 1u64,
+            ))?;
+            index_writer.add_document(doc!(
+                string_field_1 => "B".to_string(),
+                string_field_2 => "nohit".to_string(), // this doc gets filtered in this segment,
+                                                       // but the term will still be loaded because
+                                                       // min_doc_count == 0
+                score_field => 2u64,
+            ))?;
+            index_writer.commit()?;
+
+            index_writer.add_document(doc!(
+                string_field_1 => "A".to_string(),
+                string_field_2 => "hit".to_string(),
+                score_field => 2u64,
+            ))?;
+            index_writer.add_document(doc!(
+                string_field_1 => "B".to_string(),
+                string_field_2 => "hit".to_string(),
+                score_field => 4u64,
+            ))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string1",
+                    "min_doc_count": 0,
+                },
+                "aggs":{
+                    "elhistogram": {
+                        "histogram": {
+                            "field": "score",
+                            "interval": 1
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+
+        // searching for terma, but min_doc_count will return all terms
+        let res = exec_request_with_query(agg_req, &index, Some(("string2", "hit")))?;
+
+        assert_eq!(res["my_texts"]["buckets"][0]["key"], "A");
+        assert_eq!(res["my_texts"]["buckets"][0]["doc_count"], 2);
+        assert_eq!(
+            res["my_texts"]["buckets"][0]["elhistogram"]["buckets"],
+            json!([{ "doc_count": 1, "key": 1.0 }, { "doc_count": 1, "key": 2.0 } ])
+        );
+        assert_eq!(res["my_texts"]["buckets"][1]["key"], "B");
+        assert_eq!(res["my_texts"]["buckets"][1]["doc_count"], 1);
+        assert_eq!(
+            res["my_texts"]["buckets"][1]["elhistogram"]["buckets"],
+            json!([ { "doc_count": 1, "key": 4.0 } ])
+        );
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
+        assert_eq!(res["my_texts"]["doc_count_error_upper_bound"], 0);
+
+        Ok(())
+    }
+
+    #[test]
     fn terms_aggregation_error_count_test() -> crate::Result<()> {
         let terms_per_segment = vec![
             vec!["terma", "terma", "termb", "termb", "termb", "termc"], /* termc doesn't make it
@@ -1316,23 +1322,16 @@ mod tests {
 
         let index = get_test_index_from_terms(false, &terms_per_segment)?;
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        size: Some(2),
-                        segment_size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "size": 2,
+                    "segment_size": 2
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1349,24 +1348,17 @@ mod tests {
 
         // disable doc_count_error_upper_bound
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        size: Some(2),
-                        segment_size: Some(2),
-                        show_term_doc_count_error: Some(false),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "size": 2,
+                    "segment_size": 2,
+                    "show_term_doc_count_error": false
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request(agg_req, &index)?;
 
@@ -1379,34 +1371,36 @@ mod tests {
         Ok(())
     }
 
-    // TODO reenable with memory limit
-    //#[test]
-    // fn terms_aggregation_term_bucket_limit() -> crate::Result<()> {
-    // let terms: Vec<String> = (0..100_000).map(|el| el.to_string()).collect();
-    // let terms_per_segment = vec![terms.iter().map(|el| el.as_str()).collect()];
+    #[test]
+    fn terms_aggregation_term_bucket_limit() -> crate::Result<()> {
+        let terms: Vec<String> = (0..20_000).map(|el| el.to_string()).collect();
+        let terms_per_segment = vec![terms.iter().map(|el| el.as_str()).collect()];
 
-    // let index = get_test_index_from_terms(true, &terms_per_segment)?;
+        let index = get_test_index_from_terms(true, &terms_per_segment)?;
 
-    // let agg_req: Aggregations = vec![(
-    //"my_texts".to_string(),
-    // Aggregation::Bucket(BucketAggregation {
-    // bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-    // field: "string_id".to_string(),
-    // min_doc_count: Some(0),
-    //..Default::default()
-    //}),
-    // sub_aggregation: Default::default(),
-    //}),
-    //)]
-    //.into_iter()
-    //.collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "string_id",
+                    "min_doc_count": 0,
+                },
+            }
+        }))
+        .unwrap();
 
-    // let res = exec_request_with_query(agg_req, &index, None);
+        let res = exec_request_with_query_and_memory_limit(
+            agg_req,
+            &index,
+            None,
+            AggregationLimits::new(Some(50_000), None),
+        )
+        .unwrap_err();
+        assert!(res
+            .to_string()
+            .contains("Aborting aggregation because memory limit was exceeded. Limit: 50.00 KB"));
 
-    // assert!(res.is_err());
-
-    // Ok(())
-    //}
+        Ok(())
+    }
 
     #[test]
     fn terms_aggregation_different_tokenizer_on_ff_test() -> crate::Result<()> {
@@ -1414,22 +1408,15 @@ mod tests {
 
         let index = get_test_index_from_terms(true, &[terms])?;
 
-        let agg_req: Aggregations = vec![(
-            "my_texts".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "text_id".to_string(),
-                        min_doc_count: Some(0),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "text_id",
+                    "min_doc_count": 0,
+                },
+            }
+        }))
+        .unwrap();
 
         let res = exec_request_with_query(agg_req, &index, None).unwrap();
         println!("{}", serde_json::to_string_pretty(&res).unwrap());
@@ -1445,27 +1432,19 @@ mod tests {
 
     #[test]
     fn test_json_format() -> crate::Result<()> {
-        let agg_req: Aggregations = vec![(
-            "term_agg_test".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        size: Some(2),
-                        segment_size: Some(2),
-                        order: Some(CustomOrder {
-                            target: OrderTarget::Key,
-                            order: Order::Desc,
-                        }),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "term_agg_test": {
+                "terms": {
+                    "field": "string_id",
+                    "size": 2,
+                    "segment_size": 2,
+                    "order": {
+                        "_key": "desc"
+                    }
+                },
+            }
+        }))
+        .unwrap();
 
         let elasticsearch_compatible_json = json!(
         {
@@ -1495,22 +1474,15 @@ mod tests {
         });
 
         // test alias shard_size, split_size
-        let agg_req: Aggregations = vec![(
-            "term_agg_test".to_string(),
-            Aggregation::Bucket(
-                BucketAggregation {
-                    bucket_agg: BucketAggregationType::Terms(TermsAggregation {
-                        field: "string_id".to_string(),
-                        split_size: Some(2),
-                        ..Default::default()
-                    }),
-                    sub_aggregation: Default::default(),
-                }
-                .into(),
-            ),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "term_agg_test": {
+                "terms": {
+                    "field": "string_id",
+                    "split_size": 2,
+                },
+            }
+        }))
+        .unwrap();
 
         let agg_req_deser: Aggregations =
             serde_json::from_str(&serde_json::to_string(&elasticsearch_compatible_json).unwrap())
@@ -1531,6 +1503,43 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&elasticsearch_compatible_json).unwrap())
                 .unwrap();
         assert_eq!(agg_req, agg_req_deser);
+
+        Ok(())
+    }
+
+    #[test]
+    fn terms_aggregation_bytes() -> crate::Result<()> {
+        let mut schema_builder = Schema::builder();
+        let bytes_field = schema_builder.add_bytes_field("bytes", FAST);
+        let index = Index::create_in_ram(schema_builder.build());
+        {
+            let mut index_writer = index.writer_with_num_threads(1, 20_000_000)?;
+            index_writer.set_merge_policy(Box::new(NoMergePolicy));
+            index_writer.add_document(doc!(
+                bytes_field => vec![1,2,3],
+            ))?;
+            index_writer.commit()?;
+        }
+
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_texts": {
+                "terms": {
+                    "field": "bytes"
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None)?;
+
+        // TODO: Returning an error would be better instead of an empty result, since this is not a
+        // JSON field
+        assert_eq!(
+            res["my_texts"]["buckets"][0]["key"],
+            serde_json::Value::Null
+        );
+        assert_eq!(res["my_texts"]["sum_other_doc_count"], 0);
+        assert_eq!(res["my_texts"]["doc_count_error_upper_bound"], 0);
 
         Ok(())
     }

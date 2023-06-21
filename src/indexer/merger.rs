@@ -193,9 +193,8 @@ impl IndexMerger {
         // sort segments by their natural sort setting
         if max_doc >= MAX_DOC_LIMIT {
             let err_msg = format!(
-                "The segment resulting from this merge would have {} docs,which exceeds the limit \
-                 {}.",
-                max_doc, MAX_DOC_LIMIT
+                "The segment resulting from this merge would have {max_doc} docs,which exceeds \
+                 the limit {MAX_DOC_LIMIT}."
             );
             return Err(crate::TantivyError::InvalidArgument(err_msg));
         }
@@ -306,7 +305,7 @@ impl IndexMerger {
         sort_by_field: &IndexSortByField,
     ) -> crate::Result<Arc<dyn ColumnValues>> {
         reader.schema().get_field(&sort_by_field.field)?;
-        let value_accessor = reader
+        let (value_accessor, _column_type) = reader
             .fast_fields()
             .u64_lenient(&sort_by_field.field)?
             .ok_or_else(|| FastFieldNotAvailableError {

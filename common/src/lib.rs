@@ -5,6 +5,7 @@ use std::ops::Deref;
 pub use byteorder::LittleEndian as Endianness;
 
 mod bitset;
+mod byte_count;
 mod datetime;
 pub mod file_slice;
 mod group_by;
@@ -12,13 +13,15 @@ mod serialize;
 mod vint;
 mod writer;
 pub use bitset::*;
-pub use datetime::{DatePrecision, DateTime};
+pub use byte_count::ByteCount;
+#[allow(deprecated)]
+pub use datetime::DatePrecision;
+pub use datetime::{DateTime, DateTimePrecision};
 pub use group_by::GroupByIteratorExtended;
 pub use ownedbytes::{OwnedBytes, StableDeref};
 pub use serialize::{BinarySerializable, DeserializeFrom, FixedSize};
 pub use vint::{
-    deserialize_vint_u128, read_u32_vint, read_u32_vint_no_advance, serialize_vint_u128,
-    serialize_vint_u32, write_u32_vint, VInt, VIntU128,
+    read_u32_vint, read_u32_vint_no_advance, serialize_vint_u32, write_u32_vint, VInt, VIntU128,
 };
 pub use writer::{AntiCallToken, CountingWriter, TerminatingWrite};
 

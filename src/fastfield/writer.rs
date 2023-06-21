@@ -2,11 +2,13 @@ use std::io;
 
 use columnar::{ColumnarWriter, NumericalValue};
 use common::replace_in_place;
+use tokenizer_api::Token;
 
 use crate::indexer::doc_id_mapping::DocIdMapping;
 use crate::schema::term::{JSON_PATH_SEGMENT_SEP, JSON_PATH_SEGMENT_SEP_STR};
 use crate::schema::{value_type_to_column_type, Document, FieldType, Schema, Type, Value};
-use crate::{DatePrecision, DocId};
+use crate::tokenizer::{TextAnalyzer, TokenizerManager};
+use crate::{DateTimePrecision, DocId, TantivyError};
 
 /// Only index JSON down to a depth of 20.
 /// This is mostly to guard us from a stack overflow triggered by malicious input.
@@ -15,8 +17,9 @@ const JSON_DEPTH_LIMIT: usize = 20;
 /// The `FastFieldsWriter` groups all of the fast field writers.
 pub struct FastFieldsWriter {
     columnar_writer: ColumnarWriter,
-    fast_field_names: Vec<Option<String>>, //< TODO see if we can cash the field name hash too.
-    date_precisions: Vec<DatePrecision>,
+    fast_field_names: Vec<Option<String>>, //< TODO see if we can hash the field name hash too.
+    per_field_tokenizer: Vec<Option<TextAnalyzer>>,
+    date_precisions: Vec<DateTimePrecision>,
     expand_dots: Vec<bool>,
     num_docs: DocId,
     // Buffer that we recycle to avoid allocation.
@@ -25,14 +28,25 @@ pub struct FastFieldsWriter {
 
 impl FastFieldsWriter {
     /// Create all `FastFieldWriter` required by the schema.
-    pub fn from_schema(schema: &Schema) -> FastFieldsWriter {
+    #[cfg(test)]
+    pub fn from_schema(schema: &Schema) -> crate::Result<FastFieldsWriter> {
+        FastFieldsWriter::from_schema_and_tokenizer_manager(schema, TokenizerManager::new())
+    }
+
+    /// Create all `FastFieldWriter` required by the schema.
+    pub fn from_schema_and_tokenizer_manager(
+        schema: &Schema,
+        tokenizer_manager: TokenizerManager,
+    ) -> crate::Result<FastFieldsWriter> {
         let mut columnar_writer = ColumnarWriter::default();
+
         let mut fast_field_names: Vec<Option<String>> = vec![None; schema.num_fields()];
-        let mut date_precisions: Vec<DatePrecision> =
-            std::iter::repeat_with(DatePrecision::default)
+        let mut date_precisions: Vec<DateTimePrecision> =
+            std::iter::repeat_with(DateTimePrecision::default)
                 .take(schema.num_fields())
                 .collect();
         let mut expand_dots = vec![false; schema.num_fields()];
+        let mut per_field_tokenizer: Vec<Option<TextAnalyzer>> = vec![None; schema.num_fields()];
         // TODO see other types
         for (field_id, field_entry) in schema.fields() {
             if !field_entry.field_type().is_fast() {
@@ -44,9 +58,29 @@ impl FastFieldsWriter {
                 date_precisions[field_id.field_id() as usize] = date_options.get_precision();
             }
             if let FieldType::JsonObject(json_object_options) = field_entry.field_type() {
+                if let Some(tokenizer_name) = json_object_options.get_fast_field_tokenizer_name() {
+                    let text_analyzer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+                        TantivyError::InvalidArgument(format!(
+                            "Tokenizer {tokenizer_name:?} not found"
+                        ))
+                    })?;
+                    per_field_tokenizer[field_id.field_id() as usize] = Some(text_analyzer);
+                }
+
                 expand_dots[field_id.field_id() as usize] =
                     json_object_options.is_expand_dots_enabled();
             }
+            if let FieldType::Str(text_options) = field_entry.field_type() {
+                if let Some(tokenizer_name) = text_options.get_fast_field_tokenizer_name() {
+                    let text_analyzer = tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
+                        TantivyError::InvalidArgument(format!(
+                            "Tokenizer {tokenizer_name:?} not found"
+                        ))
+                    })?;
+                    per_field_tokenizer[field_id.field_id() as usize] = Some(text_analyzer);
+                }
+            }
+
             let sort_values_within_row = value_type == Type::Facet;
             if let Some(column_type) = value_type_to_column_type(value_type) {
                 columnar_writer.record_column_type(
@@ -56,14 +90,15 @@ impl FastFieldsWriter {
                 );
             }
         }
-        FastFieldsWriter {
+        Ok(FastFieldsWriter {
             columnar_writer,
             fast_field_names,
+            per_field_tokenizer,
             num_docs: 0u32,
             date_precisions,
             expand_dots,
             json_path_buffer: String::new(),
-        }
+        })
     }
 
     /// The memory used (inclusive childs)
@@ -111,14 +146,35 @@ impl FastFieldsWriter {
                         );
                     }
                     Value::Str(text_val) => {
-                        self.columnar_writer
-                            .record_str(doc_id, field_name.as_str(), text_val);
+                        if let Some(tokenizer) =
+                            &mut self.per_field_tokenizer[field_value.field().field_id() as usize]
+                        {
+                            let mut token_stream = tokenizer.token_stream(text_val);
+                            token_stream.process(&mut |token: &Token| {
+                                self.columnar_writer.record_str(
+                                    doc_id,
+                                    field_name.as_str(),
+                                    &token.text,
+                                );
+                            })
+                        } else {
+                            self.columnar_writer
+                                .record_str(doc_id, field_name.as_str(), text_val);
+                        }
                     }
                     Value::Bytes(bytes_val) => {
                         self.columnar_writer
                             .record_bytes(doc_id, field_name.as_str(), bytes_val);
                     }
-                    Value::PreTokStr(_) => todo!(),
+                    Value::PreTokStr(pre_tok) => {
+                        for token in &pre_tok.tokens {
+                            self.columnar_writer.record_str(
+                                doc_id,
+                                field_name.as_str(),
+                                &token.text,
+                            );
+                        }
+                    }
                     Value::Bool(bool_val) => {
                         self.columnar_writer
                             .record_bool(doc_id, field_name.as_str(), *bool_val);
@@ -144,6 +200,10 @@ impl FastFieldsWriter {
                         let expand_dots = self.expand_dots[field_value.field().field_id() as usize];
                         self.json_path_buffer.clear();
                         self.json_path_buffer.push_str(field_name);
+
+                        let text_analyzer =
+                            &mut self.per_field_tokenizer[field_value.field().field_id() as usize];
+
                         record_json_obj_to_columnar_writer(
                             doc_id,
                             json_obj,
@@ -151,6 +211,7 @@ impl FastFieldsWriter {
                             JSON_DEPTH_LIMIT,
                             &mut self.json_path_buffer,
                             &mut self.columnar_writer,
+                            text_analyzer,
                         );
                     }
                     Value::IpAddr(ip_addr) => {
@@ -202,6 +263,7 @@ fn record_json_obj_to_columnar_writer(
     remaining_depth_limit: usize,
     json_path_buffer: &mut String,
     columnar_writer: &mut columnar::ColumnarWriter,
+    tokenizer: &mut Option<TextAnalyzer>,
 ) {
     for (key, child) in json_obj {
         let len_path = json_path_buffer.len();
@@ -226,6 +288,7 @@ fn record_json_obj_to_columnar_writer(
             remaining_depth_limit,
             json_path_buffer,
             columnar_writer,
+            tokenizer,
         );
         // popping our sub path.
         json_path_buffer.truncate(len_path);
@@ -239,6 +302,7 @@ fn record_json_value_to_columnar_writer(
     mut remaining_depth_limit: usize,
     json_path_writer: &mut String,
     columnar_writer: &mut columnar::ColumnarWriter,
+    tokenizer: &mut Option<TextAnalyzer>,
 ) {
     if remaining_depth_limit == 0 {
         return;
@@ -257,7 +321,14 @@ fn record_json_value_to_columnar_writer(
             }
         }
         serde_json::Value::String(text) => {
-            columnar_writer.record_str(doc, json_path_writer.as_str(), text);
+            if let Some(text_analyzer) = tokenizer.as_mut() {
+                let mut token_stream = text_analyzer.token_stream(text);
+                token_stream.process(&mut |token| {
+                    columnar_writer.record_str(doc, json_path_writer.as_str(), &token.text);
+                })
+            } else {
+                columnar_writer.record_str(doc, json_path_writer.as_str(), text);
+            }
         }
         serde_json::Value::Array(arr) => {
             for el in arr {
@@ -268,6 +339,7 @@ fn record_json_value_to_columnar_writer(
                     remaining_depth_limit,
                     json_path_writer,
                     columnar_writer,
+                    tokenizer,
                 );
             }
         }
@@ -279,6 +351,7 @@ fn record_json_value_to_columnar_writer(
                 remaining_depth_limit,
                 json_path_writer,
                 columnar_writer,
+                tokenizer,
             );
         }
     }
@@ -306,6 +379,7 @@ mod tests {
                 JSON_DEPTH_LIMIT,
                 &mut json_path,
                 &mut columnar_writer,
+                &mut None,
             );
         }
         let mut buffer = Vec::new();

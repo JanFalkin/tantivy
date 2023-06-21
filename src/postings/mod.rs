@@ -17,7 +17,7 @@ mod serializer;
 mod skip;
 mod term_info;
 
-pub(crate) use stacker::compute_table_size;
+pub(crate) use stacker::compute_table_memory_size;
 
 pub use self::block_segment_postings::BlockSegmentPostings;
 pub(crate) use self::indexing_context::IndexingContext;
@@ -162,7 +162,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -194,7 +194,7 @@ pub mod tests {
         let index = Index::create_in_ram(schema);
         index
             .tokenizers()
-            .register("simple_no_truncation", SimpleTokenizer);
+            .register("simple_no_truncation", SimpleTokenizer::default());
         let reader = index.reader()?;
         let mut index_writer = index.writer_for_tests()?;
 
@@ -544,8 +544,7 @@ pub mod tests {
             let skip_result_unopt = postings_unopt.seek(target);
             assert_eq!(
                 skip_result_unopt, skip_result_opt,
-                "Failed while skipping to {}",
-                target
+                "Failed while skipping to {target}"
             );
             assert!(skip_result_opt >= target);
             assert_eq!(skip_result_opt, postings_opt.doc());

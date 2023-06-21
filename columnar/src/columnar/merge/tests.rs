@@ -1,3 +1,5 @@
+use itertools::Itertools;
+
 use super::*;
 use crate::{Cardinality, ColumnarWriter, HasAssociatedColumnType, RowId};
 
@@ -23,8 +25,10 @@ fn test_column_coercion_to_u64() {
     let columnar1 = make_columnar("numbers", &[1i64]);
     // u64 type
     let columnar2 = make_columnar("numbers", &[u64::MAX]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
-        group_columns_for_merge(&[&columnar1, &columnar2], &[]).unwrap();
+        group_columns_for_merge(columnars, &[], &merge_order).unwrap();
     assert_eq!(column_map.len(), 1);
     assert!(column_map.contains_key(&("numbers".to_string(), ColumnType::U64)));
 }
@@ -33,8 +37,10 @@ fn test_column_coercion_to_u64() {
 fn test_column_no_coercion_if_all_the_same() {
     let columnar1 = make_columnar("numbers", &[1u64]);
     let columnar2 = make_columnar("numbers", &[2u64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
-        group_columns_for_merge(&[&columnar1, &columnar2], &[]).unwrap();
+        group_columns_for_merge(columnars, &[], &merge_order).unwrap();
     assert_eq!(column_map.len(), 1);
     assert!(column_map.contains_key(&("numbers".to_string(), ColumnType::U64)));
 }
@@ -43,8 +49,10 @@ fn test_column_no_coercion_if_all_the_same() {
 fn test_column_coercion_to_i64() {
     let columnar1 = make_columnar("numbers", &[-1i64]);
     let columnar2 = make_columnar("numbers", &[2u64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
-        group_columns_for_merge(&[&columnar1, &columnar2], &[]).unwrap();
+        group_columns_for_merge(columnars, &[], &merge_order).unwrap();
     assert_eq!(column_map.len(), 1);
     assert!(column_map.contains_key(&("numbers".to_string(), ColumnType::I64)));
 }
@@ -52,10 +60,13 @@ fn test_column_coercion_to_i64() {
 #[test]
 fn test_impossible_coercion_returns_an_error() {
     let columnar1 = make_columnar("numbers", &[u64::MAX]);
-    let group_error =
-        group_columns_for_merge(&[&columnar1], &[("numbers".to_string(), ColumnType::I64)])
-            .map(|_| ())
-            .unwrap_err();
+    let merge_order = StackMergeOrder::stack(&[&columnar1]).into();
+    let group_error = group_columns_for_merge(
+        &[&columnar1],
+        &[("numbers".to_string(), ColumnType::I64)],
+        &merge_order,
+    )
+    .unwrap_err();
     assert_eq!(group_error.kind(), io::ErrorKind::InvalidInput);
 }
 
@@ -63,10 +74,13 @@ fn test_impossible_coercion_returns_an_error() {
 fn test_group_columns_with_required_column() {
     let columnar1 = make_columnar("numbers", &[1i64]);
     let columnar2 = make_columnar("numbers", &[2u64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
         group_columns_for_merge(
             &[&columnar1, &columnar2],
             &[("numbers".to_string(), ColumnType::U64)],
+            &merge_order,
         )
         .unwrap();
     assert_eq!(column_map.len(), 1);
@@ -77,10 +91,13 @@ fn test_group_columns_with_required_column() {
 fn test_group_columns_required_column_with_no_existing_columns() {
     let columnar1 = make_columnar("numbers", &[2u64]);
     let columnar2 = make_columnar("numbers", &[2u64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
         group_columns_for_merge(
-            &[&columnar1, &columnar2],
+            columnars,
             &[("required_col".to_string(), ColumnType::Str)],
+            &merge_order,
         )
         .unwrap();
     assert_eq!(column_map.len(), 2);
@@ -96,10 +113,13 @@ fn test_group_columns_required_column_with_no_existing_columns() {
 fn test_group_columns_required_column_is_above_all_columns_have_the_same_type_rule() {
     let columnar1 = make_columnar("numbers", &[2i64]);
     let columnar2 = make_columnar("numbers", &[2i64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
         group_columns_for_merge(
-            &[&columnar1, &columnar2],
+            columnars,
             &[("numbers".to_string(), ColumnType::U64)],
+            &merge_order,
         )
         .unwrap();
     assert_eq!(column_map.len(), 1);
@@ -110,8 +130,10 @@ fn test_group_columns_required_column_is_above_all_columns_have_the_same_type_ru
 fn test_missing_column() {
     let columnar1 = make_columnar("numbers", &[-1i64]);
     let columnar2 = make_columnar("numbers2", &[2u64]);
+    let columnars = &[&columnar1, &columnar2];
+    let merge_order = StackMergeOrder::stack(columnars).into();
     let column_map: BTreeMap<(String, ColumnType), Vec<Option<DynamicColumn>>> =
-        group_columns_for_merge(&[&columnar1, &columnar2], &[]).unwrap();
+        group_columns_for_merge(columnars, &[], &merge_order).unwrap();
     assert_eq!(column_map.len(), 2);
     assert!(column_map.contains_key(&("numbers".to_string(), ColumnType::I64)));
     {
@@ -249,6 +271,8 @@ fn test_merge_columnar_texts() {
     let cols = columnar_reader.read_columns("texts").unwrap();
     let dynamic_column = cols[0].open().unwrap();
     let DynamicColumn::Str(vals) = dynamic_column else { panic!() };
+    assert_eq!(vals.ords().get_cardinality(), Cardinality::Optional);
+
     let get_str_for_ord = |ord| {
         let mut out = String::new();
         vals.ord_to_str(ord, &mut out).unwrap();
@@ -375,4 +399,94 @@ fn test_merge_columnar_byte_with_missing() {
     assert!(get_bytes_for_row(5).is_empty());
     assert_eq!(get_bytes_for_row(6), vec![b"b".to_vec()]);
     assert_eq!(get_bytes_for_row(7), vec![b"a".to_vec(), b"b".to_vec()]);
+}
+
+#[test]
+fn test_merge_columnar_different_types() {
+    let columnar1 = make_text_columnar_multiple_columns(&[("mixed", &[&["a"]])]);
+    let columnar2 = make_text_columnar_multiple_columns(&[("mixed", &[&[], &["b"]])]);
+    let columnar3 = make_columnar("mixed", &[1i64]);
+    let mut buffer = Vec::new();
+    let columnars = &[&columnar1, &columnar2, &columnar3];
+    let stack_merge_order = StackMergeOrder::stack(columnars);
+    crate::columnar::merge_columnar(
+        columnars,
+        &[],
+        MergeRowOrder::Stack(stack_merge_order),
+        &mut buffer,
+    )
+    .unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    assert_eq!(columnar_reader.num_rows(), 4);
+    assert_eq!(columnar_reader.num_columns(), 2);
+    let cols = columnar_reader.read_columns("mixed").unwrap();
+
+    // numeric column
+    let dynamic_column = cols[0].open().unwrap();
+    let DynamicColumn::I64(vals) = dynamic_column else { panic!() };
+    assert_eq!(vals.get_cardinality(), Cardinality::Optional);
+    assert_eq!(vals.values_for_doc(0).collect_vec(), vec![]);
+    assert_eq!(vals.values_for_doc(1).collect_vec(), vec![]);
+    assert_eq!(vals.values_for_doc(2).collect_vec(), vec![]);
+    assert_eq!(vals.values_for_doc(3).collect_vec(), vec![1]);
+    assert_eq!(vals.values_for_doc(4).collect_vec(), vec![]);
+
+    // text column
+    let dynamic_column = cols[1].open().unwrap();
+    let DynamicColumn::Str(vals) = dynamic_column else { panic!() };
+    assert_eq!(vals.ords().get_cardinality(), Cardinality::Optional);
+    let get_str_for_ord = |ord| {
+        let mut out = String::new();
+        vals.ord_to_str(ord, &mut out).unwrap();
+        out
+    };
+
+    assert_eq!(vals.dictionary.num_terms(), 2);
+    assert_eq!(get_str_for_ord(0), "a");
+    assert_eq!(get_str_for_ord(1), "b");
+
+    let get_str_for_row = |row_id| {
+        let term_ords: Vec<String> = vals
+            .term_ords(row_id)
+            .map(|el| {
+                let mut out = String::new();
+                vals.ord_to_str(el, &mut out).unwrap();
+                out
+            })
+            .collect();
+        term_ords
+    };
+
+    assert_eq!(get_str_for_row(0), vec!["a".to_string()]);
+    assert_eq!(get_str_for_row(1), Vec::<String>::new());
+    assert_eq!(get_str_for_row(2), vec!["b".to_string()]);
+    assert_eq!(get_str_for_row(3), Vec::<String>::new());
+}
+
+#[test]
+fn test_merge_columnar_different_empty_cardinality() {
+    let columnar1 = make_text_columnar_multiple_columns(&[("mixed", &[&["a"]])]);
+    let columnar2 = make_columnar("mixed", &[1i64]);
+    let mut buffer = Vec::new();
+    let columnars = &[&columnar1, &columnar2];
+    let stack_merge_order = StackMergeOrder::stack(columnars);
+    crate::columnar::merge_columnar(
+        columnars,
+        &[],
+        MergeRowOrder::Stack(stack_merge_order),
+        &mut buffer,
+    )
+    .unwrap();
+    let columnar_reader = ColumnarReader::open(buffer).unwrap();
+    assert_eq!(columnar_reader.num_rows(), 2);
+    assert_eq!(columnar_reader.num_columns(), 2);
+    let cols = columnar_reader.read_columns("mixed").unwrap();
+
+    // numeric column
+    let dynamic_column = cols[0].open().unwrap();
+    assert_eq!(dynamic_column.get_cardinality(), Cardinality::Optional);
+
+    // text column
+    let dynamic_column = cols[1].open().unwrap();
+    assert_eq!(dynamic_column.get_cardinality(), Cardinality::Optional);
 }

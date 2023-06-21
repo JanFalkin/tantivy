@@ -27,7 +27,7 @@ pub enum Value {
     F64(f64),
     /// Bool value
     Bool(bool),
-    /// Date/time with microseconds precision
+    /// Date/time with nanoseconds precision
     Date(DateTime),
     /// Facet
     Facet(Facet),
@@ -452,8 +452,7 @@ mod binary_serialize {
                         _ => Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                                "No extended field type is associated with code {:?}",
-                                ext_type_code
+                                "No extended field type is associated with code {ext_type_code:?}"
                             ),
                         )),
                     }
@@ -477,7 +476,7 @@ mod binary_serialize {
 
                 _ => Err(io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("No field type is associated with code {:?}", type_code),
+                    format!("No field type is associated with code {type_code:?}"),
                 )),
             }
         }

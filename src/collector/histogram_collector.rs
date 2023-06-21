@@ -113,7 +113,7 @@ impl Collector for HistogramCollector {
         segment: &crate::SegmentReader,
     ) -> crate::Result<Self::Child> {
         let column_opt = segment.fast_fields().u64_lenient(&self.field)?;
-        let column = column_opt.ok_or_else(|| FastFieldNotAvailableError {
+        let (column, _column_type) = column_opt.ok_or_else(|| FastFieldNotAvailableError {
             field_name: self.field.clone(),
         })?;
         let column_u64 = column.first_or_default_col(0u64);
@@ -295,7 +295,7 @@ mod tests {
             DateTime::from_primitive(
                 Date::from_calendar_date(1980, Month::January, 1)?.with_hms(0, 0, 0)?,
             ),
-            3_600_000_000 * 24 * 365, // it is just for a unit test... sorry leap years.
+            3_600_000_000_000 * 24 * 365, // it is just for a unit test... sorry leap years.
             10,
         );
         let week_histogram = searcher.search(&all_query, &week_histogram_collector)?;

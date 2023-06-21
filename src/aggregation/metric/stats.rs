@@ -1,13 +1,15 @@
-use columnar::{Cardinality, Column, ColumnType};
+use columnar::ColumnType;
 use serde::{Deserialize, Serialize};
 
 use super::*;
-use crate::aggregation::agg_req_with_accessor::AggregationsWithAccessor;
+use crate::aggregation::agg_req_with_accessor::{
+    AggregationWithAccessor, AggregationsWithAccessor,
+};
+use crate::aggregation::f64_from_fastfield_u64;
 use crate::aggregation::intermediate_agg_result::{
-    IntermediateAggregationResults, IntermediateMetricResult,
+    IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
-use crate::aggregation::{f64_from_fastfield_u64, VecWithNames};
 use crate::{DocId, TantivyError};
 
 /// A multi-value metric aggregation that computes a collection of statistics on numeric values that
@@ -64,8 +66,7 @@ impl Stats {
             "max" => Ok(self.max),
             "avg" => Ok(self.avg),
             _ => Err(TantivyError::InvalidArgument(format!(
-                "Unknown property {} on stats metric aggregation",
-                agg_property
+                "Unknown property {agg_property} on stats metric aggregation"
             ))),
         }
     }
@@ -174,32 +175,30 @@ impl SegmentStatsCollector {
         }
     }
     #[inline]
-    pub(crate) fn collect_block_with_field(&mut self, docs: &[DocId], field: &Column<u64>) {
-        if field.get_cardinality() == Cardinality::Full {
-            self.val_cache.resize(docs.len(), 0);
-            field.values.get_vals(docs, &mut self.val_cache);
-            for val in self.val_cache.iter() {
-                let val1 = f64_from_fastfield_u64(*val, &self.field_type);
-                self.stats.collect(val1);
-            }
-        } else {
-            for doc in docs {
-                for val in field.values_for_doc(*doc) {
-                    let val1 = f64_from_fastfield_u64(val, &self.field_type);
-                    self.stats.collect(val1);
-                }
-            }
+    pub(crate) fn collect_block_with_field(
+        &mut self,
+        docs: &[DocId],
+        agg_accessor: &mut AggregationWithAccessor,
+    ) {
+        agg_accessor
+            .column_block_accessor
+            .fetch_block(docs, &agg_accessor.accessor);
+
+        for val in agg_accessor.column_block_accessor.iter_vals() {
+            let val1 = f64_from_fastfield_u64(val, &self.field_type);
+            self.stats.collect(val1);
         }
     }
 }
 
 impl SegmentAggregationCollector for SegmentStatsCollector {
     #[inline]
-    fn into_intermediate_aggregations_result(
+    fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateAggregationResults> {
-        let name = agg_with_accessor.metrics.keys[self.accessor_idx].to_string();
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        let name = agg_with_accessor.aggs.keys[self.accessor_idx].to_string();
 
         let intermediate_metric_result = match self.collecting_for {
             SegmentStatsType::Average => {
@@ -220,24 +219,21 @@ impl SegmentAggregationCollector for SegmentStatsCollector {
             }
         };
 
-        let metrics = Some(VecWithNames::from_entries(vec![(
+        results.push(
             name,
-            intermediate_metric_result,
-        )]));
+            IntermediateAggregationResult::Metric(intermediate_metric_result),
+        )?;
 
-        Ok(IntermediateAggregationResults {
-            metrics,
-            buckets: None,
-        })
+        Ok(())
     }
 
     #[inline]
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        let field = &agg_with_accessor.metrics.values[self.accessor_idx].accessor;
+        let field = &agg_with_accessor.aggs.values[self.accessor_idx].accessor;
 
         for val in field.values_for_doc(doc) {
             let val1 = f64_from_fastfield_u64(val, &self.field_type);
@@ -251,9 +247,9 @@ impl SegmentAggregationCollector for SegmentStatsCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        let field = &agg_with_accessor.metrics.values[self.accessor_idx].accessor;
+        let field = &mut agg_with_accessor.aggs.values[self.accessor_idx];
         self.collect_block_with_field(docs, field);
         Ok(())
     }
@@ -262,16 +258,10 @@ impl SegmentAggregationCollector for SegmentStatsCollector {
 #[cfg(test)]
 mod tests {
 
-    use std::iter;
-
     use serde_json::Value;
 
-    use crate::aggregation::agg_req::{
-        Aggregation, Aggregations, BucketAggregation, BucketAggregationType, MetricAggregation,
-        RangeAggregation,
-    };
+    use crate::aggregation::agg_req::{Aggregation, Aggregations};
     use crate::aggregation::agg_result::AggregationResults;
-    use crate::aggregation::metric::StatsAggregation;
     use crate::aggregation::tests::{get_test_index_2_segments, get_test_index_from_values};
     use crate::aggregation::AggregationCollector;
     use crate::query::{AllQuery, TermQuery};
@@ -285,16 +275,16 @@ mod tests {
 
         let index = get_test_index_from_values(false, &values)?;
 
-        let agg_req_1: Aggregations = vec![(
-            "stats".to_string(),
-            Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                "score".to_string(),
-            ))),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req_1: Aggregations = serde_json::from_value(json!({
+            "stats": {
+                "stats": {
+                    "field": "score",
+                },
+            }
+        }))
+        .unwrap();
 
-        let collector = AggregationCollector::from_aggs(agg_req_1, None);
+        let collector = AggregationCollector::from_aggs(agg_req_1, Default::default());
 
         let reader = index.reader()?;
         let searcher = reader.searcher();
@@ -317,21 +307,20 @@ mod tests {
 
     #[test]
     fn test_aggregation_stats_simple() -> crate::Result<()> {
-        // test index without segments
         let values = vec![10.0];
 
         let index = get_test_index_from_values(false, &values)?;
 
-        let agg_req_1: Aggregations = vec![(
-            "stats".to_string(),
-            Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                "score".to_string(),
-            ))),
-        )]
-        .into_iter()
-        .collect();
+        let agg_req_1: Aggregations = serde_json::from_value(json!({
+            "stats": {
+                "stats": {
+                    "field": "score",
+                },
+            }
+        }))
+        .unwrap();
 
-        let collector = AggregationCollector::from_aggs(agg_req_1, None);
+        let collector = AggregationCollector::from_aggs(agg_req_1, Default::default());
 
         let reader = index.reader()?;
         let searcher = reader.searcher();
@@ -364,54 +353,44 @@ mod tests {
             IndexRecordOption::Basic,
         );
 
-        let agg_req_1: Aggregations = vec![
-            (
-                "stats_i64".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                    "score_i64".to_string(),
-                ))),
-            ),
-            (
-                "stats_f64".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                    "score_f64".to_string(),
-                ))),
-            ),
-            (
-                "stats".to_string(),
-                Aggregation::Metric(MetricAggregation::Stats(StatsAggregation::from_field_name(
-                    "score".to_string(),
-                ))),
-            ),
-            (
-                "range".to_string(),
-                Aggregation::Bucket(
-                    BucketAggregation {
-                        bucket_agg: BucketAggregationType::Range(RangeAggregation {
-                            field: "score".to_string(),
-                            ranges: vec![
-                                (3f64..7f64).into(),
-                                (7f64..19f64).into(),
-                                (19f64..20f64).into(),
-                            ],
-                            ..Default::default()
-                        }),
-                        sub_aggregation: iter::once((
-                            "stats".to_string(),
-                            Aggregation::Metric(MetricAggregation::Stats(
-                                StatsAggregation::from_field_name("score".to_string()),
-                            )),
-                        ))
-                        .collect(),
+        let range_agg: Aggregation = {
+            serde_json::from_value(json!({
+                "range": {
+                    "field": "score",
+                    "ranges": [ { "from": 3.0f64, "to": 7.0f64 }, { "from": 7.0f64, "to": 19.0f64 }, { "from": 19.0f64, "to": 20.0f64 }  ]
+                },
+                "aggs": {
+                    "stats": {
+                        "stats": {
+                            "field": "score"
+                        }
                     }
-                    .into(),
-                ),
-            ),
-        ]
-        .into_iter()
-        .collect();
+                }
+            }))
+            .unwrap()
+        };
 
-        let collector = AggregationCollector::from_aggs(agg_req_1, None);
+        let agg_req_1: Aggregations = serde_json::from_value(json!({
+            "stats_i64": {
+                "stats": {
+                    "field": "score_i64",
+                },
+            },
+            "stats_f64": {
+                "stats": {
+                    "field": "score_f64",
+                },
+            },
+            "stats": {
+                "stats": {
+                    "field": "score",
+                },
+            },
+            "range": range_agg
+        }))
+        .unwrap();
+
+        let collector = AggregationCollector::from_aggs(agg_req_1, Default::default());
 
         let searcher = reader.searcher();
         let agg_res: AggregationResults = searcher.search(&term_query, &collector).unwrap();

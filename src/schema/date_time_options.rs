@@ -1,9 +1,14 @@
 use std::ops::BitOr;
 
+#[allow(deprecated)]
 pub use common::DatePrecision;
+pub use common::DateTimePrecision;
 use serde::{Deserialize, Serialize};
 
 use crate::schema::flags::{FastFlag, IndexedFlag, SchemaFlagList, StoredFlag};
+
+/// The precision of the indexed date/time values in the inverted index.
+pub const DATE_TIME_PRECISION_INDEXED: DateTimePrecision = DateTimePrecision::Seconds;
 
 /// Defines how DateTime field should be handled by tantivy.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -17,7 +22,7 @@ pub struct DateOptions {
     // Internal storage precision, used to optimize storage
     // compression on fast fields.
     #[serde(default)]
-    precision: DatePrecision,
+    precision: DateTimePrecision,
 }
 
 impl DateOptions {
@@ -85,11 +90,12 @@ impl DateOptions {
         self
     }
 
-    /// Sets the precision for this DateTime field.
+    /// Sets the precision for this DateTime field on the fast field.
+    /// Indexed precision is always [`DATE_TIME_PRECISION_INDEXED`].
     ///
     /// Internal storage precision, used to optimize storage
     /// compression on fast fields.
-    pub fn set_precision(mut self, precision: DatePrecision) -> DateOptions {
+    pub fn set_precision(mut self, precision: DateTimePrecision) -> DateOptions {
         self.precision = precision;
         self
     }
@@ -98,7 +104,7 @@ impl DateOptions {
     ///
     /// Internal storage precision, used to optimize storage
     /// compression on fast fields.
-    pub fn get_precision(&self) -> DatePrecision {
+    pub fn get_precision(&self) -> DateTimePrecision {
         self.precision
     }
 }
