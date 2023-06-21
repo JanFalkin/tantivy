@@ -56,7 +56,7 @@ pub(crate) fn idf(doc_freq: u64, doc_count: u64) -> Score {
 }
 
 fn cached_tf_component(fieldnorm: u32, average_fieldnorm: Score) -> Score {
-    unsafe{K1 * (1.0 - B + B * fieldnorm as Score / average_fieldnorm)}
+    unsafe { K1 * (1.0 - B + B * fieldnorm as Score / average_fieldnorm) }
 }
 
 fn compute_tf_cache(average_fieldnorm: Score) -> [Score; 256] {
@@ -149,13 +149,15 @@ impl Bm25Weight {
     }
 
     pub(crate) fn new(idf_explain: Explanation, average_fieldnorm: Score) -> Bm25Weight {
-        unsafe{let weight = idf_explain.value() * (1.0 + K1);
-        Bm25Weight {
-            idf_explain,
-            weight,
-            cache: compute_tf_cache(average_fieldnorm),
-            average_fieldnorm,
-        }}
+        unsafe {
+            let weight = idf_explain.value() * (1.0 + K1);
+            Bm25Weight {
+                idf_explain,
+                weight,
+                cache: compute_tf_cache(average_fieldnorm),
+                average_fieldnorm,
+            }
+        }
     }
 
     /// Compute the BM25 score of a single document.
@@ -192,7 +194,7 @@ impl Bm25Weight {
         );
 
         tf_explanation.add_const("freq, occurrences of term within document", term_freq);
-        unsafe{
+        unsafe {
             tf_explanation.add_const("k1, term saturation parameter", K1);
             tf_explanation.add_const("b, length normalization parameter", B);
         }
@@ -203,8 +205,8 @@ impl Bm25Weight {
         tf_explanation.add_const("avgdl, average length of field", self.average_fieldnorm);
 
         let mut explanation = Explanation::new("TermQuery, product of...", score);
-        unsafe{
-        explanation.add_detail(Explanation::new("(K1+1)", K1 + 1.0));
+        unsafe {
+            explanation.add_detail(Explanation::new("(K1+1)", K1 + 1.0));
         }
         explanation.add_detail(self.idf_explain.clone());
         explanation.add_detail(tf_explanation);
