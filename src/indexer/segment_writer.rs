@@ -1,5 +1,6 @@
 use columnar::MonotonicallyMappableToU64;
 use itertools::Itertools;
+use tokenizer_api::BoxTokenStream;
 
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
@@ -99,7 +100,7 @@ impl SegmentWriter {
                     _ => None,
                 };
                 let tokenizer_name = text_options
-                    .and_then(|text_index_option| Some(text_index_option.tokenizer()))
+                    .map(|text_index_option| text_index_option.tokenizer())
                     .unwrap_or("default");
 
                 tokenizer_manager.get(tokenizer_name).ok_or_else(|| {
@@ -209,7 +210,7 @@ impl SegmentWriter {
                     for value in values {
                         let mut token_stream = match value {
                             Value::PreTokStr(tok_str) => {
-                                PreTokenizedStream::from(tok_str.clone()).into()
+                                BoxTokenStream::new(PreTokenizedStream::from(tok_str.clone()))
                             }
                             Value::Str(ref text) => {
                                 let text_analyzer =
