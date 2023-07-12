@@ -6,7 +6,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
-use fail::fail_point;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
 use super::segment_manager::SegmentManager;
@@ -43,7 +42,7 @@ pub(crate) fn save_metas(metas: &IndexMeta, directory: &dyn Directory) -> crate:
     let mut buffer = serde_json::to_vec_pretty(metas)?;
     // Just adding a new line at the end of the buffer.
     writeln!(&mut buffer)?;
-    fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
+    crate::fail_point!("save_metas", |msg| Err(crate::TantivyError::from(
         std::io::Error::new(
             std::io::ErrorKind::Other,
             msg.unwrap_or_else(|| "Undefined".to_string())
@@ -238,8 +237,7 @@ pub fn merge_filtered_segments<T: Into<Box<dyn Directory>>>(
         segments
             .iter()
             .fold(String::new(), |sum, current| format!(
-                "{}{} ",
-                sum,
+                "{sum}{} ",
                 current.meta().id().uuid_string()
             ))
             .trim_end()
@@ -533,7 +531,7 @@ impl SegmentUpdater {
                         merge_error
                     );
                     if cfg!(test) {
-                        panic!("{:?}", merge_error);
+                        panic!("{merge_error:?}");
                     }
                     let _send_result = merging_future_send.send(Err(merge_error));
                 }

@@ -35,18 +35,19 @@ impl BufAggregationCollector {
 
 impl SegmentAggregationCollector for BufAggregationCollector {
     #[inline]
-    fn into_intermediate_aggregations_result(
+    fn add_intermediate_aggregation_result(
         self: Box<Self>,
         agg_with_accessor: &AggregationsWithAccessor,
-    ) -> crate::Result<IntermediateAggregationResults> {
-        Box::new(self.collector).into_intermediate_aggregations_result(agg_with_accessor)
+        results: &mut IntermediateAggregationResults,
+    ) -> crate::Result<()> {
+        Box::new(self.collector).add_intermediate_aggregation_result(agg_with_accessor, results)
     }
 
     #[inline]
     fn collect(
         &mut self,
         doc: crate::DocId,
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
         self.staged_docs[self.num_staged_docs] = doc;
         self.num_staged_docs += 1;
@@ -62,16 +63,15 @@ impl SegmentAggregationCollector for BufAggregationCollector {
     fn collect_block(
         &mut self,
         docs: &[crate::DocId],
-        agg_with_accessor: &AggregationsWithAccessor,
+        agg_with_accessor: &mut AggregationsWithAccessor,
     ) -> crate::Result<()> {
-        for doc in docs {
-            self.collect(*doc, agg_with_accessor)?;
-        }
+        self.collector.collect_block(docs, agg_with_accessor)?;
+
         Ok(())
     }
 
     #[inline]
-    fn flush(&mut self, agg_with_accessor: &AggregationsWithAccessor) -> crate::Result<()> {
+    fn flush(&mut self, agg_with_accessor: &mut AggregationsWithAccessor) -> crate::Result<()> {
         self.collector
             .collect_block(&self.staged_docs[..self.num_staged_docs], agg_with_accessor)?;
         self.num_staged_docs = 0;

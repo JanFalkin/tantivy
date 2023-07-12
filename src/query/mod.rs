@@ -31,11 +31,10 @@ mod vec_docset;
 pub(crate) mod score_combiner;
 pub use query_grammar::Occur;
 
-
 /// set_k_and_b
 /// enables modification of previous constants in bm25
-pub fn do_set_k_and_b(k:f32, b:f32){
-    unsafe{
+pub fn do_set_k_and_b(k: f32, b: f32) {
+    unsafe {
         crate::query::bm25::K1 = k;
         crate::query::bm25::B = b;
     }
@@ -45,9 +44,8 @@ pub use self::all_query::{AllQuery, AllScorer, AllWeight};
 pub use self::automaton_weight::AutomatonWeight;
 pub use self::bitset::BitSetDocSet;
 pub use self::bm25::{Bm25StatisticsProvider, Bm25Weight};
-pub use self::boolean_query::BooleanQuery;
-pub(crate) use self::boolean_query::BooleanWeight;
-pub use self::boost_query::BoostQuery;
+pub use self::boolean_query::{BooleanQuery, BooleanWeight};
+pub use self::boost_query::{BoostQuery, BoostWeight};
 pub use self::const_score_query::{ConstScoreQuery, ConstScorer};
 pub use self::disjunction_max_query::DisjunctionMaxQuery;
 pub use self::empty_query::{EmptyQuery, EmptyScorer, EmptyWeight};
@@ -62,7 +60,7 @@ pub use self::phrase_prefix_query::PhrasePrefixQuery;
 pub use self::phrase_query::PhraseQuery;
 pub use self::query::{EnableScoring, Query, QueryClone};
 pub use self::query_parser::{QueryParser, QueryParserError};
-pub use self::range_query::RangeQuery;
+pub use self::range_query::{FastFieldRangeWeight, IPFastFieldRangeWeight, RangeQuery};
 pub use self::regex_query::RegexQuery;
 pub use self::reqopt_scorer::RequiredOptionalScorer;
 pub use self::score_combiner::{
@@ -78,17 +76,15 @@ pub use self::weight::Weight;
 
 #[cfg(test)]
 mod tests {
-    use crate::query::QueryParser;
+    use crate::query::{do_set_k_and_b, QueryParser};
     use crate::schema::{Schema, TEXT};
     use crate::{Index, Term};
-    use crate::query::do_set_k_and_b;
 
     #[test]
     fn test_set_kb() {
-        do_set_k_and_b(1.0,1.0);
-        do_set_k_and_b(1.2,0.75);
+        do_set_k_and_b(1.0, 1.0);
+        do_set_k_and_b(1.2, 0.75);
     }
-
 
     #[test]
     fn test_query_terms() {

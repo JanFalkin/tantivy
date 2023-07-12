@@ -61,19 +61,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub(crate) fn sstable_reader_block(
         &self,
         block_addr: BlockAddr,
-    ) -> io::Result<Reader<'static, TSSTable::ValueReader>> {
+    ) -> io::Result<Reader<TSSTable::ValueReader>> {
         let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
-        Ok(TSSTable::reader(data))
-    }
-
-    pub(crate) async fn sstable_reader_block_async(
-        &self,
-        block_addr: BlockAddr,
-    ) -> io::Result<Reader<'static, TSSTable::ValueReader>> {
-        let data = self
-            .sstable_slice
-            .read_bytes_slice_async(block_addr.byte_range)
-            .await?;
         Ok(TSSTable::reader(data))
     }
 
@@ -81,7 +70,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
-    ) -> io::Result<DeltaReader<'static, TSSTable::ValueReader>> {
+    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let slice = self.file_slice_for_range(key_range, limit);
         let data = slice.read_bytes_async().await?;
         Ok(TSSTable::delta_reader(data))
@@ -91,7 +80,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         &self,
         key_range: impl RangeBounds<[u8]>,
         limit: Option<u64>,
-    ) -> io::Result<DeltaReader<'static, TSSTable::ValueReader>> {
+    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let slice = self.file_slice_for_range(key_range, limit);
         let data = slice.read_bytes()?;
         Ok(TSSTable::delta_reader(data))
@@ -100,8 +89,19 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     pub(crate) fn sstable_delta_reader_block(
         &self,
         block_addr: BlockAddr,
-    ) -> io::Result<DeltaReader<'static, TSSTable::ValueReader>> {
+    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
         let data = self.sstable_slice.read_bytes_slice(block_addr.byte_range)?;
+        Ok(TSSTable::delta_reader(data))
+    }
+
+    pub(crate) async fn sstable_delta_reader_block_async(
+        &self,
+        block_addr: BlockAddr,
+    ) -> io::Result<DeltaReader<TSSTable::ValueReader>> {
+        let data = self
+            .sstable_slice
+            .read_bytes_slice_async(block_addr.byte_range)
+            .await?;
         Ok(TSSTable::delta_reader(data))
     }
 
@@ -110,7 +110,7 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// only block for up to `limit` matching terms.
     ///
     /// It works by identifying
-    /// - `first_block`: the block containing the start boudary key
+    /// - `first_block`: the block containing the start boundary key
     /// - `last_block`: the block containing the end boundary key.
     ///
     /// And then returning the range that spans over all blocks between.
@@ -178,13 +178,25 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
 
     /// Opens a `TermDictionary`.
     pub fn open(term_dictionary_file: FileSlice) -> io::Result<Self> {
-        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(16);
+        let (main_slice, footer_len_slice) = term_dictionary_file.split_from_end(20);
         let mut footer_len_bytes: OwnedBytes = footer_len_slice.read_bytes()?;
+
         let index_offset = u64::deserialize(&mut footer_len_bytes)?;
         let num_terms = u64::deserialize(&mut footer_len_bytes)?;
+        let version = u32::deserialize(&mut footer_len_bytes)?;
+        if version != crate::SSTABLE_VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!(
+                    "Unsuported sstable version, expected {version}, found {}",
+                    crate::SSTABLE_VERSION,
+                ),
+            ));
+        }
+
         let (sstable_slice, index_slice) = main_slice.split(index_offset as usize);
         let sstable_index_bytes = index_slice.read_bytes()?;
-        let sstable_index = SSTableIndex::load(sstable_index_bytes.as_slice())
+        let sstable_index = SSTableIndex::load(sstable_index_bytes)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "SSTable corruption"))?;
         Ok(Dictionary {
             sstable_slice,
@@ -215,23 +227,25 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         self.num_terms as usize
     }
 
-    /// Returns the ordinal associated with a given term.
-    pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
+    /// Decode a DeltaReader up to key, returning the number of terms traversed
+    ///
+    /// If the key was not found, returns Ok(None).
+    /// After calling this function, it is possible to call `DeltaReader::value` to get the
+    /// associated value.
+    fn decode_up_to_key<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        sstable_delta_reader: &mut DeltaReader<TSSTable::ValueReader>,
+    ) -> io::Result<Option<TermOrdinal>> {
+        let mut term_ord = 0;
         let key_bytes = key.as_ref();
-
-        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) else {
-            return Ok(None);
-        };
-
-        let mut term_ord = block_addr.first_ordinal;
         let mut ok_bytes = 0;
-        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
         while sstable_delta_reader.advance()? {
             let prefix_len = sstable_delta_reader.common_prefix_len();
             let suffix = sstable_delta_reader.suffix();
 
             match prefix_len.cmp(&ok_bytes) {
-                Ordering::Less => return Ok(None), // poped bytes already matched => too far
+                Ordering::Less => return Ok(None), // popped bytes already matched => too far
                 Ordering::Equal => (),
                 Ordering::Greater => {
                     // the ok prefix is less than current entry prefix => continue to next elem
@@ -262,6 +276,20 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
         }
 
         Ok(None)
+    }
+
+    /// Returns the ordinal associated with a given term.
+    pub fn term_ord<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TermOrdinal>> {
+        let key_bytes = key.as_ref();
+
+        let Some(block_addr) = self.sstable_index.get_block_with_key(key_bytes) else {
+            return Ok(None);
+        };
+
+        let first_ordinal = block_addr.first_ordinal;
+        let mut sstable_delta_reader = self.sstable_delta_reader_block(block_addr)?;
+        self.decode_up_to_key(key_bytes, &mut sstable_delta_reader)
+            .map(|opt| opt.map(|ord| ord + first_ordinal))
     }
 
     /// Returns the term associated with a given term ordinal.
@@ -309,14 +337,8 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Lookups the value corresponding to the key.
     pub fn get<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
         if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
-            let mut sstable_reader = self.sstable_reader_block(block_addr)?;
-            let key_bytes = key.as_ref();
-            while sstable_reader.advance()? {
-                if sstable_reader.key() == key_bytes {
-                    let value = sstable_reader.value().clone();
-                    return Ok(Some(value));
-                }
-            }
+            let sstable_reader = self.sstable_delta_reader_block(block_addr)?;
+            return self.do_get(key, sstable_reader);
         }
         Ok(None)
     }
@@ -324,26 +346,32 @@ impl<TSSTable: SSTable> Dictionary<TSSTable> {
     /// Lookups the value corresponding to the key.
     pub async fn get_async<K: AsRef<[u8]>>(&self, key: K) -> io::Result<Option<TSSTable::Value>> {
         if let Some(block_addr) = self.sstable_index.get_block_with_key(key.as_ref()) {
-            let mut sstable_reader = self.sstable_reader_block_async(block_addr).await?;
-            let key_bytes = key.as_ref();
-            while sstable_reader.advance()? {
-                if sstable_reader.key() == key_bytes {
-                    let value = sstable_reader.value().clone();
-                    return Ok(Some(value));
-                }
-            }
+            let sstable_reader = self.sstable_delta_reader_block_async(block_addr).await?;
+            return self.do_get(key, sstable_reader);
         }
         Ok(None)
     }
 
+    fn do_get<K: AsRef<[u8]>>(
+        &self,
+        key: K,
+        mut reader: DeltaReader<TSSTable::ValueReader>,
+    ) -> io::Result<Option<TSSTable::Value>> {
+        if let Some(_ord) = self.decode_up_to_key(key, &mut reader)? {
+            Ok(Some(reader.value().clone()))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Returns a range builder, to stream all of the terms
     /// within an interval.
-    pub fn range(&self) -> StreamerBuilder<'_, TSSTable> {
+    pub fn range(&self) -> StreamerBuilder<TSSTable> {
         StreamerBuilder::new(self, AlwaysMatch)
     }
 
     /// A stream of all the sorted terms.
-    pub fn stream(&self) -> io::Result<Streamer<'_, TSSTable>> {
+    pub fn stream(&self) -> io::Result<Streamer<TSSTable>> {
         self.range().into_stream()
     }
 
@@ -422,7 +450,7 @@ mod tests {
         // this makes 256k keys, enough to fill multiple blocks.
         for elem in 0..0x3ffff {
             let key = format!("{elem:05X}").into_bytes();
-            builder.insert_cannot_fail(&key, &elem);
+            builder.insert(&key, &elem).unwrap();
         }
 
         let table = builder.finish().unwrap();
@@ -470,7 +498,7 @@ mod tests {
         let new_range = dic.sstable_index.get_block_with_ord(ordinal).byte_range;
         slice.restrict(new_range);
         assert!(dic.ord_to_term(ordinal, &mut res).unwrap());
-        assert_eq!(res, format!("{:05X}", ordinal).into_bytes());
+        assert_eq!(res, format!("{ordinal:05X}").into_bytes());
         assert_eq!(dic.term_info_from_ord(ordinal).unwrap().unwrap(), ordinal);
         assert_eq!(dic.get(&res).unwrap().unwrap(), ordinal);
         assert_eq!(dic.term_ord(&res).unwrap().unwrap(), ordinal);

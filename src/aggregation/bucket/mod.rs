@@ -1,11 +1,26 @@
 //! Module for all bucket aggregations.
 //!
-//! BucketAggregations create buckets of documents
-//! [`BucketAggregation`](super::agg_req::BucketAggregation).
+//! BucketAggregations create buckets of documents.
+//! Each bucket is associated with a rule which
+//! determines whether or not a document in the falls into it. In other words, the buckets
+//! effectively define document sets. Buckets are not necessarily disjunct, therefore a document can
+//! fall into multiple buckets. In addition to the buckets themselves, the bucket aggregations also
+//! compute and return the number of documents for each bucket. Bucket aggregations, as opposed to
+//! metric aggregations, can hold sub-aggregations. These sub-aggregations will be aggregated for
+//! the buckets created by their "parent" bucket aggregation. There are different bucket
+//! aggregators, each with a different "bucketing" strategy. Some define a single bucket, some
+//! define fixed number of multiple buckets, and others dynamically create the buckets during the
+//! aggregation process.
 //!
 //! Results of final buckets are [`BucketResult`](super::agg_result::BucketResult).
 //! Results of intermediate buckets are
 //! [`IntermediateBucketResult`](super::intermediate_agg_result::IntermediateBucketResult)
+//!
+//! ## Supported Bucket Aggregations
+//! - [Histogram](HistogramAggregation)
+//! - [DateHistogram](DateHistogramAggregationReq)
+//! - [Range](RangeAggregation)
+//! - [Terms](TermsAggregation)
 
 mod histogram;
 mod range;

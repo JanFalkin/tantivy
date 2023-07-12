@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fmt::Debug;
 use std::net::Ipv6Addr;
 
@@ -21,6 +22,22 @@ pub enum ColumnType {
     DateTime = 7u8,
 }
 
+impl fmt::Display for ColumnType {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let short_str = match self {
+            ColumnType::I64 => "i64",
+            ColumnType::U64 => "u64",
+            ColumnType::F64 => "f64",
+            ColumnType::Bytes => "bytes",
+            ColumnType::Str => "str",
+            ColumnType::Bool => "bool",
+            ColumnType::IpAddr => "ip",
+            ColumnType::DateTime => "datetime",
+        };
+        write!(f, "{short_str}")
+    }
+}
+
 // The order needs to match _exactly_ the order in the enum
 const COLUMN_TYPES: [ColumnType; 8] = [
     ColumnType::I64,
@@ -36,6 +53,9 @@ const COLUMN_TYPES: [ColumnType; 8] = [
 impl ColumnType {
     pub fn to_code(self) -> u8 {
         self as u8
+    }
+    pub fn is_date_time(&self) -> bool {
+        self == &ColumnType::DateTime
     }
 
     pub(crate) fn try_from_code(code: u8) -> Result<ColumnType, InvalidData> {

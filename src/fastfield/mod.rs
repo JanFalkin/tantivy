@@ -14,7 +14,7 @@
 //! Fields have to be declared as `FAST` in the schema.
 //! Currently supported fields are: u64, i64, f64, bytes, ip and text.
 //!
-//! Fast fields are stored in with [different codecs](fastfield_codecs). The best codec is detected
+//! Fast fields are stored in with [different codecs](columnar). The best codec is detected
 //! automatically, when serializing.
 //!
 //! Read access performance is comparable to that of an array lookup.
@@ -80,7 +80,7 @@ mod tests {
     use std::path::Path;
 
     use columnar::{Column, MonotonicallyMappableToU64, StrColumn};
-    use common::{HasLen, TerminatingWrite};
+    use common::{ByteCount, HasLen, TerminatingWrite};
     use once_cell::sync::Lazy;
     use rand::prelude::SliceRandom;
     use rand::rngs::StdRng;
@@ -90,11 +90,12 @@ mod tests {
     use crate::directory::{Directory, RamDirectory, WritePtr};
     use crate::merge_policy::NoMergePolicy;
     use crate::schema::{
-        Document, Facet, FacetOptions, Field, JsonObjectOptions, Schema, SchemaBuilder, FAST,
-        INDEXED, STORED, STRING, TEXT,
+        Document, Facet, FacetOptions, Field, JsonObjectOptions, Schema, SchemaBuilder,
+        TextOptions, FAST, INDEXED, STORED, STRING, TEXT,
     };
     use crate::time::OffsetDateTime;
-    use crate::{DateOptions, DatePrecision, Index, SegmentId, SegmentReader};
+    use crate::tokenizer::{LowerCaser, RawTokenizer, TextAnalyzer, TokenizerManager};
+    use crate::{DateOptions, DateTimePrecision, Index, SegmentId, SegmentReader};
 
     pub static SCHEMA: Lazy<Schema> = Lazy::new(|| {
         let mut schema_builder = Schema::builder();
@@ -115,7 +116,7 @@ mod tests {
         let directory: RamDirectory = RamDirectory::create();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA).unwrap();
             fast_field_writers
                 .add_document(&doc!(*FIELD=>13u64))
                 .unwrap();
@@ -130,7 +131,7 @@ mod tests {
         }
         let file = directory.open_read(path).unwrap();
 
-        assert_eq!(file.len(), 161);
+        assert_eq!(file.len(), 93);
         let fast_field_readers = FastFieldReaders::open(file, SCHEMA.clone()).unwrap();
         let column = fast_field_readers
             .u64("field")
@@ -148,7 +149,7 @@ mod tests {
         let directory: RamDirectory = RamDirectory::create();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA).unwrap();
             fast_field_writers
                 .add_document(&doc!(*FIELD=>4u64))
                 .unwrap();
@@ -180,7 +181,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 189);
+        assert_eq!(file.len(), 121);
         let fast_field_readers = FastFieldReaders::open(file, SCHEMA.clone()).unwrap();
         let col = fast_field_readers
             .u64("field")
@@ -203,7 +204,7 @@ mod tests {
         let directory: RamDirectory = RamDirectory::create();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA).unwrap();
             for _ in 0..10_000 {
                 fast_field_writers
                     .add_document(&doc!(*FIELD=>100_000u64))
@@ -213,7 +214,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 162);
+        assert_eq!(file.len(), 94);
         let fast_field_readers = FastFieldReaders::open(file, SCHEMA.clone()).unwrap();
         let fast_field_reader = fast_field_readers
             .u64("field")
@@ -231,7 +232,7 @@ mod tests {
 
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA).unwrap();
             // forcing the amplitude to be high
             fast_field_writers
                 .add_document(&doc!(*FIELD=>0u64))
@@ -245,7 +246,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 4557);
+        assert_eq!(file.len(), 4489);
         {
             let fast_field_readers = FastFieldReaders::open(file, SCHEMA.clone()).unwrap();
             let col = fast_field_readers
@@ -268,7 +269,7 @@ mod tests {
         let schema = schema_builder.build();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             for i in -100i64..10_000i64 {
                 let mut doc = Document::default();
                 doc.add_i64(i64_field, i);
@@ -278,7 +279,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 333_usize);
+        assert_eq!(file.len(), 265);
 
         {
             let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
@@ -310,7 +311,7 @@ mod tests {
 
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = Document::default();
             fast_field_writers.add_document(&doc).unwrap();
             fast_field_writers.serialize(&mut write, None).unwrap();
@@ -343,7 +344,7 @@ mod tests {
         let schema = schema_builder.build();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = Document::default();
             fast_field_writers.add_document(&doc).unwrap();
             fast_field_writers.serialize(&mut write, None).unwrap();
@@ -379,7 +380,7 @@ mod tests {
         let directory = RamDirectory::create();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&SCHEMA).unwrap();
             for &x in &permutation {
                 fast_field_writers.add_document(&doc!(*FIELD=>x)).unwrap();
             }
@@ -685,12 +686,12 @@ mod tests {
         let mut schema_builder = Schema::builder();
         let date_field = schema_builder.add_date_field(
             "date",
-            DateOptions::from(FAST).set_precision(DatePrecision::Microseconds),
+            DateOptions::from(FAST).set_precision(DateTimePrecision::Nanoseconds),
         );
         let multi_date_field = schema_builder.add_date_field(
             "multi_date",
             DateOptions::default()
-                .set_precision(DatePrecision::Microseconds)
+                .set_precision(DateTimePrecision::Nanoseconds)
                 .set_fast(),
         );
         let schema = schema_builder.build();
@@ -724,25 +725,25 @@ mod tests {
             .column_opt::<DateTime>("multi_date")
             .unwrap()
             .unwrap();
-        let mut dates = vec![];
+        let mut dates = Vec::new();
         {
-            assert_eq!(date_fast_field.get_val(0).into_timestamp_micros(), 1i64);
+            assert_eq!(date_fast_field.get_val(0).into_timestamp_nanos(), 1i64);
             dates_fast_field.fill_vals(0u32, &mut dates);
             assert_eq!(dates.len(), 2);
-            assert_eq!(dates[0].into_timestamp_micros(), 2i64);
-            assert_eq!(dates[1].into_timestamp_micros(), 3i64);
+            assert_eq!(dates[0].into_timestamp_nanos(), 2i64);
+            assert_eq!(dates[1].into_timestamp_nanos(), 3i64);
         }
         {
-            assert_eq!(date_fast_field.get_val(1).into_timestamp_micros(), 4i64);
+            assert_eq!(date_fast_field.get_val(1).into_timestamp_nanos(), 4i64);
             dates_fast_field.fill_vals(1u32, &mut dates);
             assert!(dates.is_empty());
         }
         {
-            assert_eq!(date_fast_field.get_val(2).into_timestamp_micros(), 0i64);
+            assert_eq!(date_fast_field.get_val(2).into_timestamp_nanos(), 0i64);
             dates_fast_field.fill_vals(2u32, &mut dates);
             assert_eq!(dates.len(), 2);
-            assert_eq!(dates[0].into_timestamp_micros(), 5i64);
-            assert_eq!(dates[1].into_timestamp_micros(), 6i64);
+            assert_eq!(dates[0].into_timestamp_nanos(), 5i64);
+            assert_eq!(dates[1].into_timestamp_nanos(), 6i64);
         }
         Ok(())
     }
@@ -759,7 +760,7 @@ mod tests {
 
         {
             let mut write: WritePtr = directory.open_write(path).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             fast_field_writers.add_document(&doc!(field=>true)).unwrap();
             fast_field_writers
                 .add_document(&doc!(field=>false))
@@ -772,7 +773,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 175);
+        assert_eq!(file.len(), 102);
         let fast_field_readers = FastFieldReaders::open(file, schema).unwrap();
         let bool_col = fast_field_readers.bool("field_bool").unwrap();
         assert_eq!(bool_col.first(0), Some(true));
@@ -793,7 +794,7 @@ mod tests {
 
         {
             let mut write: WritePtr = directory.open_write(path).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             for _ in 0..50 {
                 fast_field_writers.add_document(&doc!(field=>true)).unwrap();
                 fast_field_writers
@@ -804,7 +805,7 @@ mod tests {
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 187);
+        assert_eq!(file.len(), 114);
         let readers = FastFieldReaders::open(file, schema).unwrap();
         let bool_col = readers.bool("field_bool").unwrap();
         for i in 0..25 {
@@ -822,14 +823,14 @@ mod tests {
         let schema = schema_builder.build();
         {
             let mut write: WritePtr = directory.open_write(path).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(&schema).unwrap();
             let doc = Document::default();
             fast_field_writers.add_document(&doc).unwrap();
             fast_field_writers.serialize(&mut write, None).unwrap();
             write.terminate().unwrap();
         }
         let file = directory.open_read(path).unwrap();
-        assert_eq!(file.len(), 177);
+        assert_eq!(file.len(), 104);
         let fastfield_readers = FastFieldReaders::open(file, schema).unwrap();
         let col = fastfield_readers.bool("field_bool").unwrap();
         assert_eq!(col.first(0), None);
@@ -849,7 +850,7 @@ mod tests {
         let directory: RamDirectory = RamDirectory::create();
         {
             let mut write: WritePtr = directory.open_write(Path::new("test")).unwrap();
-            let mut fast_field_writers = FastFieldsWriter::from_schema(schema);
+            let mut fast_field_writers = FastFieldsWriter::from_schema(schema).unwrap();
             for doc in docs {
                 fast_field_writers.add_document(doc).unwrap();
             }
@@ -861,17 +862,17 @@ mod tests {
 
     #[test]
     pub fn test_gcd_date() {
-        let size_prec_sec = test_gcd_date_with_codec(DatePrecision::Seconds);
-        assert!((1000 * 13 / 8..100 + 1000 * 13 / 8).contains(&size_prec_sec)); // 13 bits per val = ceil(log_2(number of seconds in 2hours);
-        let size_prec_micros = test_gcd_date_with_codec(DatePrecision::Microseconds);
-        assert!((1000 * 33 / 8..100 + 1000 * 33 / 8).contains(&size_prec_micros));
+        let size_prec_sec = test_gcd_date_with_codec(DateTimePrecision::Seconds);
+        assert!((1000 * 13 / 8..100 + 1000 * 13 / 8).contains(&size_prec_sec.get_bytes())); // 13 bits per val = ceil(log_2(number of seconds in 2hours);
+        let size_prec_micros = test_gcd_date_with_codec(DateTimePrecision::Microseconds);
+        assert!((1000 * 33 / 8..100 + 1000 * 33 / 8).contains(&size_prec_micros.get_bytes()));
         // 33 bits per
         // val = ceil(log_2(number
         // of microsecsseconds
         // in 2hours);
     }
 
-    fn test_gcd_date_with_codec(precision: DatePrecision) -> usize {
+    fn test_gcd_date_with_codec(precision: DateTimePrecision) -> ByteCount {
         let mut rng = StdRng::seed_from_u64(2u64);
         const T0: i64 = 1_662_345_825_012_529i64;
         const ONE_HOUR_IN_MICROSECS: i64 = 3_600 * 1_000_000;
@@ -1068,8 +1069,8 @@ mod tests {
         let searcher = index.reader().unwrap().searcher();
         let segment_reader = searcher.segment_reader(0u32);
         let fast_fields = segment_reader.fast_fields();
-        let column_without_opt: Option<StrColumn> = fast_fields.str("without.hello").unwrap();
-        assert!(column_without_opt.is_none());
+        let column_without_opt = fast_fields.str("without.hello");
+        assert!(column_without_opt.is_err());
         let column_with_opt: Option<StrColumn> = fast_fields.str("with.hello").unwrap();
         let column_with: StrColumn = column_with_opt.unwrap();
         assert!(column_with.term_ords(0).next().is_none());
@@ -1081,7 +1082,7 @@ mod tests {
     #[test]
     fn test_fast_field_in_json_field_expand_dots_disabled() {
         let mut schema_builder = Schema::builder();
-        let json_option = JsonObjectOptions::default().set_fast();
+        let json_option = JsonObjectOptions::default().set_fast(None);
         let json = schema_builder.add_json_field("json", json_option);
         let schema = schema_builder.build();
         let index = Index::create_in_ram(schema);
@@ -1105,10 +1106,35 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_field_in_json_field_with_tokenizer() {
+        let mut schema_builder = Schema::builder();
+        let json_option = JsonObjectOptions::default().set_fast(Some("default"));
+        let json = schema_builder.add_json_field("json", json_option);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(json => json!({"age": 32})))
+            .unwrap();
+        index_writer
+            .add_document(doc!(json => json!({"age": "NEW"})))
+            .unwrap();
+
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_fields = searcher.segment_reader(0u32).fast_fields();
+
+        let ff_str = fast_fields.str("json.age").unwrap().unwrap();
+        let mut output = String::new();
+        ff_str.ord_to_str(0, &mut output).unwrap();
+        assert_eq!(output, "new");
+    }
+
+    #[test]
     fn test_fast_field_in_json_field_expand_dots_enabled() {
         let mut schema_builder = Schema::builder();
         let json_option = JsonObjectOptions::default()
-            .set_fast()
+            .set_fast(None)
             .set_expand_dots_enabled();
         let json = schema_builder.add_json_field("json", json_option);
         let schema = schema_builder.build();
@@ -1174,10 +1200,78 @@ mod tests {
     }
 
     #[test]
+    fn test_fast_field_tokenizer() {
+        let mut schema_builder = Schema::builder();
+        let opt = TextOptions::default().set_fast(Some("custom_lowercase"));
+        let text_field = schema_builder.add_text_field("text", opt);
+        let schema = schema_builder.build();
+        let ff_tokenizer_manager = TokenizerManager::default();
+        ff_tokenizer_manager.register(
+            "custom_lowercase",
+            TextAnalyzer::builder(RawTokenizer::default())
+                .filter(LowerCaser)
+                .build(),
+        );
+
+        let mut index = Index::create_in_ram(schema);
+        index.set_fast_field_tokenizers(ff_tokenizer_manager);
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(text_field => "Test1 test2"))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_field_reader = searcher.segment_reader(0u32).fast_fields();
+        let column = fast_field_reader.str("text").unwrap().unwrap();
+        let mut out = String::new();
+        column.ord_to_str(0u64, &mut out).unwrap();
+        assert_eq!(&out, "test1 test2");
+    }
+
+    #[test]
+    fn test_text_fast_field_tokenizer() {
+        let mut schema_builder = Schema::builder();
+
+        let text_fieldtype = crate::schema::TextOptions::default()
+            .set_indexing_options(
+                crate::schema::TextFieldIndexing::default()
+                    .set_index_option(crate::schema::IndexRecordOption::WithFreqs)
+                    .set_tokenizer("raw"),
+            )
+            .set_fast(Some("default"))
+            .set_stored();
+
+        let log_field = schema_builder.add_text_field("log_level", text_fieldtype);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut index_writer = index.writer_for_tests().unwrap();
+        index_writer
+            .add_document(doc!(log_field => "info"))
+            .unwrap();
+        index_writer
+            .add_document(doc!(log_field => "INFO"))
+            .unwrap();
+        index_writer.commit().unwrap();
+        let searcher = index.reader().unwrap().searcher();
+        let fast_field_reader = searcher.segment_reader(0u32).fast_fields();
+
+        let text_fast_field = fast_field_reader.str("log_level").unwrap().unwrap();
+        let mut buffer = String::new();
+        assert!(text_fast_field.ord_to_str(0, &mut buffer).unwrap());
+        assert_eq!(buffer, "info");
+        assert!(!text_fast_field.ord_to_str(1, &mut buffer).unwrap());
+
+        assert!(text_fast_field.term_ords(0).eq([0].into_iter()));
+        assert!(text_fast_field.term_ords(1).eq([0].into_iter()));
+        assert!(text_fast_field.ords().values_for_doc(0u32).eq([0]));
+        assert!(text_fast_field.ords().values_for_doc(1u32).eq([0]));
+    }
+
+    #[test]
     fn test_shadowing_fast_field_with_expand_dots() {
         let mut schema_builder = Schema::builder();
         let json_option = JsonObjectOptions::default()
-            .set_fast()
+            .set_fast(None)
             .set_expand_dots_enabled();
         let json_field = schema_builder.add_json_field("jsonfield", json_option.clone());
         let shadowing_json_field = schema_builder.add_json_field("jsonfield.attr", json_option);
