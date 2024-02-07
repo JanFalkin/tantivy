@@ -6,9 +6,9 @@ use tokenizer_api::BoxTokenStream;
 use super::doc_id_mapping::{get_doc_id_mapping_from_field, DocIdMapping};
 use super::operation::AddOperation;
 use crate::core::json_utils::index_json_values;
-use crate::core::Segment;
 use crate::fastfield::FastFieldsWriter;
 use crate::fieldnorm::{FieldNormReaders, FieldNormsWriter};
+use crate::index::Segment;
 use crate::indexer::segment_serializer::SegmentSerializer;
 use crate::postings::{
     compute_table_memory_size, serialize_postings, IndexingContext, IndexingPosition,
@@ -877,6 +877,31 @@ mod tests {
         assert_eq!(searcher.search(&phrase_query, &Count).unwrap(), 1);
         let phrase_query = PhraseQuery::new(vec![nothello_term, happy_term]);
         assert_eq!(searcher.search(&phrase_query, &Count).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_json_term_with_numeric_merge_panic_regression_bug_2283() {
+        // https://github.com/quickwit-oss/tantivy/issues/2283
+        let mut schema_builder = Schema::builder();
+        let json = schema_builder.add_json_field("json", TEXT);
+        let schema = schema_builder.build();
+        let index = Index::create_in_ram(schema);
+        let mut writer = index.writer_for_tests().unwrap();
+        let doc = json!({"field": "a"});
+        writer.add_document(doc!(json=>doc)).unwrap();
+        writer.commit().unwrap();
+        let doc = json!({"field": "a", "id": 1});
+        writer.add_document(doc!(json=>doc.clone())).unwrap();
+        writer.commit().unwrap();
+
+        // Force Merge
+        writer.wait_merging_threads().unwrap();
+        let mut index_writer: IndexWriter = index.writer_for_tests().unwrap();
+        let segment_ids = index
+            .searchable_segment_ids()
+            .expect("Searchable segments failed.");
+        index_writer.merge(&segment_ids).wait().unwrap();
+        assert!(index_writer.wait_merging_threads().is_ok());
     }
 
     #[test]
