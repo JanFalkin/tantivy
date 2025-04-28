@@ -52,8 +52,14 @@ impl<TCollector: Collector> Collector for CollectorWrapper<TCollector> {
 impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
     type Fruit = Box<dyn Fruit>;
 
+    #[inline]
     fn collect(&mut self, doc: u32, score: Score) {
         self.as_mut().collect(doc, score);
+    }
+
+    #[inline]
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.as_mut().collect_block(docs);
     }
 
     fn harvest(self) -> Box<dyn Fruit> {
@@ -63,6 +69,11 @@ impl SegmentCollector for Box<dyn BoxableSegmentCollector> {
 
 pub trait BoxableSegmentCollector {
     fn collect(&mut self, doc: u32, score: Score);
+    fn collect_block(&mut self, docs: &[DocId]) {
+        for &doc in docs {
+            self.collect(doc, 0.0);
+        }
+    }
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit>;
 }
 
@@ -71,8 +82,13 @@ pub struct SegmentCollectorWrapper<TSegmentCollector: SegmentCollector>(TSegment
 impl<TSegmentCollector: SegmentCollector> BoxableSegmentCollector
     for SegmentCollectorWrapper<TSegmentCollector>
 {
+    #[inline]
     fn collect(&mut self, doc: u32, score: Score) {
         self.0.collect(doc, score);
+    }
+    #[inline]
+    fn collect_block(&mut self, docs: &[DocId]) {
+        self.0.collect_block(docs);
     }
 
     fn harvest_from_box(self: Box<Self>) -> Box<dyn Fruit> {
@@ -145,7 +161,7 @@ impl<TFruit: Fruit> FruitHandle<TFruit> {
 /// # Ok(())
 /// # }
 /// ```
-#[allow(clippy::type_complexity)]
+#[expect(clippy::type_complexity)]
 #[derive(Default)]
 pub struct MultiCollector<'a> {
     collector_wrappers: Vec<
@@ -174,7 +190,7 @@ impl<'a> MultiCollector<'a> {
     }
 }
 
-impl<'a> Collector for MultiCollector<'a> {
+impl Collector for MultiCollector<'_> {
     type Fruit = MultiFruit;
     type Child = MultiCollectorChild;
 

@@ -244,7 +244,7 @@ impl MmapDirectory {
                 directory_path,
             )));
         }
-        #[allow(clippy::bind_instead_of_map)]
+        #[expect(clippy::bind_instead_of_map)]
         let canonical_path: PathBuf = directory_path.canonicalize().or_else(|io_err| {
             let directory_path = directory_path.to_owned();
 
@@ -479,6 +479,7 @@ impl Directory for MmapDirectory {
         let file: File = OpenOptions::new()
             .write(true)
             .create(true) //< if the file does not exist yet, create it.
+            .truncate(false)
             .open(full_path)
             .map_err(LockError::wrap_io_error)?;
         if lock.is_blocking {
@@ -565,7 +566,7 @@ mod tests {
         let mmap_directory = MmapDirectory::create_from_tempdir().unwrap();
         let num_paths = 10;
         let paths: Vec<PathBuf> = (0..num_paths)
-            .map(|i| PathBuf::from(&*format!("file_{}", i)))
+            .map(|i| PathBuf::from(&*format!("file_{i}")))
             .collect();
         {
             for path in &paths {

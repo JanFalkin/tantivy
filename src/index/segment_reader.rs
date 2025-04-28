@@ -318,14 +318,14 @@ impl SegmentReader {
                         if create_canonical {
                             // Without expand dots enabled dots need to be escaped.
                             let escaped_json_path = json_path.replace('.', "\\.");
-                            let full_path = format!("{}.{}", field_name, escaped_json_path);
+                            let full_path = format!("{field_name}.{escaped_json_path}");
                             let full_path_unescaped = format!("{}.{}", field_name, &json_path);
                             map_to_canonical.insert(full_path_unescaped, full_path.to_string());
                             full_path
                         } else {
                             // With expand dots enabled, we can use '.' instead of '\u{1}'.
                             json_path_sep_to_dot(&mut json_path);
-                            format!("{}.{}", field_name, json_path)
+                            format!("{field_name}.{json_path}")
                         }
                     };
                     indexed_fields.extend(
@@ -358,7 +358,7 @@ impl SegmentReader {
             .map(|(mut field_name, handle)| {
                 json_path_sep_to_dot(&mut field_name);
                 // map to canonical path, to avoid similar but different entries.
-                // Eventually we should just accept '.' seperated for all cases.
+                // Eventually we should just accept '.' separated for all cases.
                 let field_name = map_to_canonical
                     .get(&field_name)
                     .unwrap_or(&field_name)
@@ -406,7 +406,7 @@ impl SegmentReader {
     }
 
     /// Returns an iterator that will iterate over the alive document ids
-    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + '_> {
+    pub fn doc_ids_alive(&self) -> Box<dyn Iterator<Item = DocId> + Send + '_> {
         if let Some(alive_bitset) = &self.alive_bitset_opt {
             Box::new(alive_bitset.iter_alive())
         } else {
@@ -478,7 +478,7 @@ pub fn merge_field_meta_data(
         .into_iter()
         .kmerge_by(|left, right| left < right)
         // TODO: Remove allocation
-        .group_by(|el| (el.field_name.to_string(), el.typ))
+        .chunk_by(|el| (el.field_name.to_string(), el.typ))
     {
         let mut merged: FieldMetadata = group.next().unwrap();
         for el in group {
@@ -516,8 +516,8 @@ impl fmt::Debug for SegmentReader {
 mod test {
     use super::*;
     use crate::index::Index;
-    use crate::schema::{Schema, SchemaBuilder, Term, STORED, TEXT};
-    use crate::{DocId, IndexWriter};
+    use crate::schema::{SchemaBuilder, Term, STORED, TEXT};
+    use crate::IndexWriter;
 
     #[test]
     fn test_merge_field_meta_data_same() {

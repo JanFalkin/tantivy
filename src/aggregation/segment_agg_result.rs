@@ -5,18 +5,21 @@
 
 use std::fmt::Debug;
 
-pub(crate) use super::agg_limits::AggregationLimits;
+pub(crate) use super::agg_limits::AggregationLimitsGuard;
 use super::agg_req::AggregationVariants;
 use super::agg_req_with_accessor::{AggregationWithAccessor, AggregationsWithAccessor};
 use super::bucket::{SegmentHistogramCollector, SegmentRangeCollector, SegmentTermCollector};
 use super::intermediate_agg_result::IntermediateAggregationResults;
 use super::metric::{
-    AverageAggregation, CountAggregation, MaxAggregation, MinAggregation,
+    AverageAggregation, CountAggregation, ExtendedStatsAggregation, MaxAggregation, MinAggregation,
     SegmentPercentilesCollector, SegmentStatsCollector, SegmentStatsType, StatsAggregation,
     SumAggregation,
 };
 use crate::aggregation::bucket::TermMissingAgg;
-use crate::aggregation::metric::SegmentTopHitsCollector;
+use crate::aggregation::metric::{
+    CardinalityAggregationReq, SegmentCardinalityCollector, SegmentExtendedStatsCollector,
+    TopHitsSegmentCollector,
+};
 
 pub(crate) trait SegmentAggregationCollector: CollectorClone + Debug {
     fn add_intermediate_aggregation_result(
@@ -100,7 +103,7 @@ pub(crate) fn build_single_agg_segment_collector(
         Range(range_req) => Ok(Box::new(SegmentRangeCollector::from_req_and_validate(
             range_req,
             &mut req.sub_aggregation,
-            &req.limits,
+            &mut req.limits,
             req.field_type,
             accessor_idx,
         )?)),
@@ -148,6 +151,9 @@ pub(crate) fn build_single_agg_segment_collector(
             accessor_idx,
             *missing,
         ))),
+        ExtendedStats(ExtendedStatsAggregation { missing, sigma, .. }) => Ok(Box::new(
+            SegmentExtendedStatsCollector::from_req(req.field_type, *sigma, accessor_idx, *missing),
+        )),
         Sum(SumAggregation { missing, .. }) => Ok(Box::new(SegmentStatsCollector::from_req(
             req.field_type,
             SegmentStatsType::Sum,
@@ -161,11 +167,14 @@ pub(crate) fn build_single_agg_segment_collector(
                 accessor_idx,
             )?,
         )),
-        TopHits(top_hits_req) => Ok(Box::new(SegmentTopHitsCollector::from_req(
+        TopHits(top_hits_req) => Ok(Box::new(TopHitsSegmentCollector::from_req(
             top_hits_req,
             accessor_idx,
             req.segment_ordinal,
         ))),
+        Cardinality(CardinalityAggregationReq { missing, .. }) => Ok(Box::new(
+            SegmentCardinalityCollector::from_req(req.field_type, accessor_idx, missing),
+        )),
     }
 }
 

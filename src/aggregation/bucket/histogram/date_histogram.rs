@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::{HistogramAggregation, HistogramBounds};
-use crate::aggregation::AggregationError;
+use crate::aggregation::*;
 
 /// DateHistogramAggregation is similar to `HistogramAggregation`, but it can only be used with date
 /// type.
@@ -34,10 +34,10 @@ use crate::aggregation::AggregationError;
 pub struct DateHistogramAggregationReq {
     #[doc(hidden)]
     /// Only for validation
-    interval: Option<String>,
+    pub interval: Option<String>,
     #[doc(hidden)]
     /// Only for validation
-    calendar_interval: Option<String>,
+    pub calendar_interval: Option<String>,
     /// The field to aggregate on.
     pub field: String,
     /// The format to format dates. Unsupported currently.
@@ -244,7 +244,7 @@ fn parse_into_milliseconds(input: &str) -> Result<i64, AggregationError> {
 }
 
 #[cfg(test)]
-pub mod tests {
+pub(crate) mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
@@ -352,7 +352,9 @@ pub mod tests {
         let docs = vec![
             vec![r#"{ "date": "2015-01-01T12:10:30Z", "text": "aaa" }"#],
             vec![r#"{ "date": "2015-01-01T11:11:30Z", "text": "bbb" }"#],
+            vec![r#"{ "date": "2015-01-01T11:11:30Z", "text": "bbb" }"#],
             vec![r#"{ "date": "2015-01-02T00:00:00Z", "text": "bbb" }"#],
+            vec![r#"{ "date": "2015-01-06T00:00:00Z", "text": "ccc" }"#],
             vec![r#"{ "date": "2015-01-06T00:00:00Z", "text": "ccc" }"#],
         ];
         let index = get_test_index_from_docs(merge_segments, &docs).unwrap();
@@ -382,7 +384,7 @@ pub mod tests {
                         {
                             "key_as_string" : "2015-01-01T00:00:00Z",
                             "key" : 1420070400000.0,
-                            "doc_count" : 4
+                            "doc_count" : 6
                         }
                     ]
                 }
@@ -420,15 +422,15 @@ pub mod tests {
                     {
                         "key_as_string" : "2015-01-01T00:00:00Z",
                         "key" : 1420070400000.0,
-                        "doc_count" : 4,
+                        "doc_count" : 6,
                         "texts": {
                             "buckets": [
                                 {
-                                "doc_count": 2,
+                                "doc_count": 3,
                                 "key": "bbb"
                                 },
                                 {
-                                "doc_count": 1,
+                                "doc_count": 2,
                                 "key": "ccc"
                                 },
                                 {
@@ -467,7 +469,7 @@ pub mod tests {
                 "sales_over_time": {
                     "buckets": [
                         {
-                            "doc_count": 2,
+                            "doc_count": 3,
                             "key": 1420070400000.0,
                             "key_as_string": "2015-01-01T00:00:00Z"
                         },
@@ -492,7 +494,7 @@ pub mod tests {
                             "key_as_string": "2015-01-05T00:00:00Z"
                         },
                         {
-                            "doc_count": 1,
+                            "doc_count": 2,
                             "key": 1420502400000.0,
                             "key_as_string": "2015-01-06T00:00:00Z"
                         }
@@ -533,7 +535,7 @@ pub mod tests {
                             "key_as_string": "2014-12-31T00:00:00Z"
                         },
                         {
-                            "doc_count": 2,
+                            "doc_count": 3,
                             "key": 1420070400000.0,
                             "key_as_string": "2015-01-01T00:00:00Z"
                         },
@@ -558,7 +560,7 @@ pub mod tests {
                             "key_as_string": "2015-01-05T00:00:00Z"
                         },
                         {
-                            "doc_count": 1,
+                            "doc_count": 2,
                             "key": 1420502400000.0,
                             "key_as_string": "2015-01-06T00:00:00Z"
                         },

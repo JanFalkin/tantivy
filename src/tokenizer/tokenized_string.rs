@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::io;
 use std::io::{Read, Write};
 
-use common::BinarySerializable;
+use common::*;
 
 use crate::tokenizer::{Token, TokenStream};
 
@@ -95,7 +95,6 @@ impl TokenStream for PreTokenizedStream {
 mod tests {
 
     use super::*;
-    use crate::tokenizer::Token;
 
     #[test]
     fn test_tokenized_stream() {

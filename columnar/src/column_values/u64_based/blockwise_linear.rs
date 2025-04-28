@@ -4,12 +4,12 @@ use std::{io, iter};
 
 use common::{BinarySerializable, CountingWriter, DeserializeFrom, OwnedBytes};
 use fastdivide::DividerU64;
-use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
+use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 
+use crate::MonotonicallyMappableToU64;
 use crate::column_values::u64_based::line::Line;
 use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 use crate::column_values::{ColumnValues, VecColumn};
-use crate::MonotonicallyMappableToU64;
 
 const BLOCK_SIZE: u32 = 512u32;
 
@@ -39,7 +39,7 @@ impl BinarySerializable for Block {
 }
 
 fn compute_num_blocks(num_vals: u32) -> u32 {
-    (num_vals + BLOCK_SIZE - 1) / BLOCK_SIZE
+    num_vals.div_ceil(BLOCK_SIZE)
 }
 
 pub struct BlockwiseLinearEstimator {
@@ -63,7 +63,10 @@ impl BlockwiseLinearEstimator {
         if self.block.is_empty() {
             return;
         }
-        let line = Line::train(&VecColumn::from(&self.block));
+        let column = VecColumn::from(std::mem::take(&mut self.block));
+        let line = Line::train(&column);
+        self.block = column.into();
+
         let mut max_value = 0u64;
         for (i, buffer_val) in self.block.iter().enumerate() {
             let interpolated_val = line.eval(i as u32);
@@ -125,7 +128,7 @@ impl ColumnCodecEstimator for BlockwiseLinearEstimator {
                 *buffer_val = gcd_divider.divide(*buffer_val - stats.min_value);
             }
 
-            let line = Line::train(&VecColumn::from(&buffer));
+            let line = Line::train(&VecColumn::from(buffer.to_vec()));
 
             assert!(!buffer.is_empty());
 

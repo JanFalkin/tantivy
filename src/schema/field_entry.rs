@@ -12,8 +12,7 @@ use crate::schema::{
 ///
 /// It consists of
 /// - a field name
-/// - a field type, itself wrapping up options describing
-/// how the field should be indexed.
+/// - a field type, itself wrapping up options describing how the field should be indexed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FieldEntry {
     name: String,
@@ -136,7 +135,6 @@ impl FieldEntry {
 
 #[cfg(test)]
 mod tests {
-    use serde_json;
 
     use super::*;
     use crate::schema::{Schema, TextFieldIndexing, TEXT};

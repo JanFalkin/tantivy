@@ -1,12 +1,13 @@
 use std::io;
 use std::io::Write;
 
+use common::json_path_writer::JSON_END_OF_PATH;
 use common::{BinarySerializable, CountingWriter};
-use sstable::value::RangeValueWriter;
 use sstable::RangeSSTable;
+use sstable::value::RangeValueWriter;
 
-use crate::columnar::ColumnType;
 use crate::RowId;
+use crate::columnar::ColumnType;
 
 pub struct ColumnarSerializer<W: io::Write> {
     wrt: CountingWriter<W>,
@@ -19,7 +20,7 @@ pub struct ColumnarSerializer<W: io::Write> {
 fn prepare_key(key: &[u8], column_type: ColumnType, buffer: &mut Vec<u8>) {
     buffer.clear();
     buffer.extend_from_slice(key);
-    buffer.push(0u8);
+    buffer.push(JSON_END_OF_PATH);
     buffer.push(column_type.to_code());
 }
 
@@ -66,7 +67,7 @@ pub struct ColumnSerializer<'a, W: io::Write> {
     start_offset: u64,
 }
 
-impl<'a, W: io::Write> ColumnSerializer<'a, W> {
+impl<W: io::Write> ColumnSerializer<'_, W> {
     pub fn finalize(self) -> io::Result<()> {
         let end_offset: u64 = self.columnar_serializer.wrt.written_bytes();
         let byte_range = self.start_offset..end_offset;
@@ -79,7 +80,7 @@ impl<'a, W: io::Write> ColumnSerializer<'a, W> {
     }
 }
 
-impl<'a, W: io::Write> io::Write for ColumnSerializer<'a, W> {
+impl<W: io::Write> io::Write for ColumnSerializer<'_, W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.columnar_serializer.wrt.write(buf)
     }
@@ -90,21 +91,5 @@ impl<'a, W: io::Write> io::Write for ColumnSerializer<'a, W> {
 
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         self.columnar_serializer.wrt.write_all(buf)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::columnar::column_type::ColumnType;
-
-    #[test]
-    fn test_prepare_key_bytes() {
-        let mut buffer: Vec<u8> = b"somegarbage".to_vec();
-        prepare_key(b"root\0child", ColumnType::Str, &mut buffer);
-        assert_eq!(buffer.len(), 12);
-        assert_eq!(&buffer[..10], b"root\0child");
-        assert_eq!(buffer[10], 0u8);
-        assert_eq!(buffer[11], ColumnType::Str.to_code());
     }
 }

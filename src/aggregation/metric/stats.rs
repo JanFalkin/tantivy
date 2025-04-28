@@ -1,4 +1,5 @@
-use columnar::ColumnType;
+use std::fmt::Debug;
+
 use serde::{Deserialize, Serialize};
 
 use super::*;
@@ -9,7 +10,7 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
-use crate::aggregation::{f64_from_fastfield_u64, f64_to_fastfield_u64};
+use crate::aggregation::*;
 use crate::{DocId, TantivyError};
 
 /// A multi-value metric aggregation that computes a collection of statistics on numeric values that
@@ -33,7 +34,7 @@ pub struct StatsAggregation {
     /// By default they will be ignored but it is also possible to treat them as if they had a
     /// value. Examples in JSON format:
     /// { "field": "my_numbers", "missing": "10.0" }
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_option_f64")]
     pub missing: Option<f64>,
 }
 
@@ -86,13 +87,15 @@ impl Stats {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct IntermediateStats {
     /// The number of extracted values.
-    count: u64,
+    pub(crate) count: u64,
     /// The sum of the extracted values.
-    sum: f64,
+    pub(crate) sum: f64,
+    /// delta for sum needed for [Kahan algorithm for summation](https://en.wikipedia.org/wiki/Kahan_summation_algorithm)
+    pub(crate) delta: f64,
     /// The min value.
-    min: f64,
+    pub(crate) min: f64,
     /// The max value.
-    max: f64,
+    pub(crate) max: f64,
 }
 
 impl Default for IntermediateStats {
@@ -100,6 +103,7 @@ impl Default for IntermediateStats {
         Self {
             count: 0,
             sum: 0.0,
+            delta: 0.0,
             min: f64::MAX,
             max: f64::MIN,
         }
@@ -110,7 +114,13 @@ impl IntermediateStats {
     /// Merges the other stats intermediate result into self.
     pub fn merge_fruits(&mut self, other: IntermediateStats) {
         self.count += other.count;
-        self.sum += other.sum;
+
+        // kahan algorithm for sum
+        let y = other.sum - (self.delta + other.delta);
+        let t = self.sum + y;
+        self.delta = (t - self.sum) - y;
+        self.sum = t;
+
         self.min = self.min.min(other.min);
         self.max = self.max.max(other.max);
     }
@@ -142,9 +152,15 @@ impl IntermediateStats {
     }
 
     #[inline]
-    fn collect(&mut self, value: f64) {
+    pub(in crate::aggregation::metric) fn collect(&mut self, value: f64) {
         self.count += 1;
-        self.sum += value;
+
+        // kahan algorithm for sum
+        let y = value - self.delta;
+        let t = self.sum + y;
+        self.delta = (t - self.sum) - y;
+        self.sum = t;
+
         self.min = self.min.min(value);
         self.max = self.max.max(value);
     }
@@ -204,9 +220,23 @@ impl SegmentStatsCollector {
                 .column_block_accessor
                 .fetch_block(docs, &agg_accessor.accessor);
         }
-        for val in agg_accessor.column_block_accessor.iter_vals() {
-            let val1 = f64_from_fastfield_u64(val, &self.field_type);
-            self.stats.collect(val1);
+        if [
+            ColumnType::I64,
+            ColumnType::U64,
+            ColumnType::F64,
+            ColumnType::DateTime,
+        ]
+        .contains(&self.field_type)
+        {
+            for val in agg_accessor.column_block_accessor.iter_vals() {
+                let val1 = f64_from_fastfield_u64(val, &self.field_type);
+                self.stats.collect(val1);
+            }
+        } else {
+            for _val in agg_accessor.column_block_accessor.iter_vals() {
+                // we ignore the value and simply record that we got something
+                self.stats.collect(0.0);
+            }
         }
     }
 }
@@ -289,7 +319,6 @@ impl SegmentAggregationCollector for SegmentStatsCollector {
 
 #[cfg(test)]
 mod tests {
-
     use serde_json::Value;
 
     use crate::aggregation::agg_req::{Aggregation, Aggregations};
@@ -420,6 +449,11 @@ mod tests {
                     "field": "score",
                 },
             },
+            "count_str": {
+                "value_count": {
+                    "field": "text",
+                },
+            },
             "range": range_agg
         }))
         .unwrap();
@@ -482,6 +516,13 @@ mod tests {
                 "max": serde_json::Value::Null,
                 "min": serde_json::Value::Null,
                 "sum": 0.0,
+            })
+        );
+
+        assert_eq!(
+            res["count_str"],
+            json!({
+                "value": 7.0,
             })
         );
 
@@ -562,6 +603,30 @@ mod tests {
                 "stats": {
                     "field": "json.partially_empty",
                     "missing": 0.0
+                },
+            }
+        }))
+        .unwrap();
+
+        let res = exec_request_with_query(agg_req, &index, None)?;
+
+        assert_eq!(
+            res["my_stats"],
+            json!({
+                "avg":  2.5,
+                "count": 4,
+                "max": 10.0,
+                "min": 0.0,
+                "sum": 10.0
+            })
+        );
+
+        // From string
+        let agg_req: Aggregations = serde_json::from_value(json!({
+            "my_stats": {
+                "stats": {
+                    "field": "json.partially_empty",
+                    "missing": "0.0"
                 },
             }
         }))

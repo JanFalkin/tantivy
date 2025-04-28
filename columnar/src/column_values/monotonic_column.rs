@@ -2,8 +2,8 @@ use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::{Range, RangeInclusive};
 
-use crate::column_values::monotonic_mapping::StrictlyMonotonicFn;
 use crate::ColumnValues;
+use crate::column_values::monotonic_mapping::StrictlyMonotonicFn;
 
 struct MonotonicMappingColumn<C, T, Input> {
     from_column: C,
@@ -31,10 +31,10 @@ pub fn monotonic_map_column<C, T, Input, Output>(
     monotonic_mapping: T,
 ) -> impl ColumnValues<Output>
 where
-    C: ColumnValues<Input>,
-    T: StrictlyMonotonicFn<Input, Output> + Send + Sync,
-    Input: PartialOrd + Debug + Send + Sync + Clone,
-    Output: PartialOrd + Debug + Send + Sync + Clone,
+    C: ColumnValues<Input> + 'static,
+    T: StrictlyMonotonicFn<Input, Output> + Send + Sync + 'static,
+    Input: PartialOrd + Debug + Send + Sync + Clone + 'static,
+    Output: PartialOrd + Debug + Send + Sync + Clone + 'static,
 {
     MonotonicMappingColumn {
         from_column,
@@ -45,10 +45,10 @@ where
 
 impl<C, T, Input, Output> ColumnValues<Output> for MonotonicMappingColumn<C, T, Input>
 where
-    C: ColumnValues<Input>,
-    T: StrictlyMonotonicFn<Input, Output> + Send + Sync,
-    Input: PartialOrd + Send + Debug + Sync + Clone,
-    Output: PartialOrd + Send + Debug + Sync + Clone,
+    C: ColumnValues<Input> + 'static,
+    T: StrictlyMonotonicFn<Input, Output> + Send + Sync + 'static,
+    Input: PartialOrd + Send + Debug + Sync + Clone + 'static,
+    Output: PartialOrd + Send + Debug + Sync + Clone + 'static,
 {
     #[inline(always)]
     fn get_val(&self, idx: u32) -> Output {
@@ -99,15 +99,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::column_values::VecColumn;
     use crate::column_values::monotonic_mapping::{
         StrictlyMonotonicMappingInverter, StrictlyMonotonicMappingToInternal,
     };
-    use crate::column_values::VecColumn;
 
     #[test]
     fn test_monotonic_mapping_iter() {
         let vals: Vec<u64> = (0..100u64).map(|el| el * 10).collect();
-        let col = VecColumn::from(&vals);
+        let col = VecColumn::from(vals);
         let mapped = monotonic_map_column(
             col,
             StrictlyMonotonicMappingInverter::from(StrictlyMonotonicMappingToInternal::<i64>::new()),

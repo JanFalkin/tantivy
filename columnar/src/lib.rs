@@ -44,11 +44,11 @@ pub use block_accessor::ColumnBlockAccessor;
 pub use column::{BytesColumn, Column, StrColumn};
 pub use column_index::ColumnIndex;
 pub use column_values::{
-    ColumnValues, EmptyColumnValues, MonotonicallyMappableToU128, MonotonicallyMappableToU64,
+    ColumnValues, EmptyColumnValues, MonotonicallyMappableToU64, MonotonicallyMappableToU128,
 };
 pub use columnar::{
-    merge_columnar, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
-    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder,
+    CURRENT_VERSION, ColumnType, ColumnarReader, ColumnarWriter, HasAssociatedColumnType,
+    MergeRowOrder, ShuffleMergeOrder, StackMergeOrder, Version, merge_columnar,
 };
 use sstable::VoidSSTable;
 pub use value::{NumericalType, NumericalValue};
@@ -113,6 +113,9 @@ impl Cardinality {
     pub fn is_multivalue(&self) -> bool {
         matches!(self, Cardinality::Multivalued)
     }
+    pub fn is_full(&self) -> bool {
+        matches!(self, Cardinality::Full)
+    }
     pub(crate) fn to_code(self) -> u8 {
         self as u8
     }
@@ -128,3 +131,6 @@ impl Cardinality {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod compat_tests;
