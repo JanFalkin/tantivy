@@ -11,7 +11,7 @@ use crate::column_values::u64_based::*;
 fn get_data() -> Vec<u64> {
     let mut rng = StdRng::seed_from_u64(2u64);
     let mut data: Vec<_> = (100..55000_u64)
-        .map(|num| num + rng.gen::<u8>() as u64)
+        .map(|num| num + rng.r#gen::<u8>() as u64)
         .collect();
     data.push(99_000);
     data.insert(1000, 2000);
@@ -34,6 +34,7 @@ fn compute_stats(vals: impl Iterator<Item = u64>) -> ColumnStats {
 fn value_iter() -> impl Iterator<Item = u64> {
     0..20_000
 }
+
 fn get_reader_for_bench<Codec: ColumnCodec>(data: &[u64]) -> Codec::ColumnValues {
     let mut bytes = Vec::new();
     let stats = compute_stats(data.iter().cloned());
@@ -41,10 +42,13 @@ fn get_reader_for_bench<Codec: ColumnCodec>(data: &[u64]) -> Codec::ColumnValues
     for val in data {
         codec_serializer.collect(*val);
     }
-    codec_serializer.serialize(&stats, Box::new(data.iter().copied()).as_mut(), &mut bytes);
+    codec_serializer
+        .serialize(&stats, Box::new(data.iter().copied()).as_mut(), &mut bytes)
+        .unwrap();
 
     Codec::load(OwnedBytes::new(bytes)).unwrap()
 }
+
 fn bench_get<Codec: ColumnCodec>(b: &mut Bencher, data: &[u64]) {
     let col = get_reader_for_bench::<Codec>(data);
     b.iter(|| {

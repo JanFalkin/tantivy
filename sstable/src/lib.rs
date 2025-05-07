@@ -1,9 +1,9 @@
 use std::io::{self, Write};
 use std::ops::Range;
-use std::usize;
 
 use merge::ValueMerger;
 
+mod block_match_automaton;
 mod delta;
 mod dictionary;
 pub mod merge;
@@ -86,7 +86,6 @@ pub trait SSTable: Sized {
     }
 }
 
-#[allow(dead_code)]
 pub struct VoidSSTable;
 
 impl SSTable for VoidSSTable {
@@ -101,7 +100,6 @@ impl SSTable for VoidSSTable {
 /// In other words, two keys `k1` and `k2`
 /// such that `k1` <= `k2`, are required to observe
 /// `range_sstable[k1] <= range_sstable[k2]`.
-#[allow(dead_code)]
 pub struct MonotonicU64SSTable;
 
 impl SSTable for MonotonicU64SSTable {
@@ -324,7 +322,7 @@ mod test {
 
     use common::OwnedBytes;
 
-    use super::{common_prefix_len, MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable};
+    use super::{MonotonicU64SSTable, SSTable, VoidMerge, VoidSSTable, common_prefix_len};
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(
@@ -387,7 +385,7 @@ mod test {
                 16, 17, 33, 18, 19, 17, 20, // data block
                 0, 0, 0, 0, // no more block
                 // index
-                0, 0, 0, 0, 0, 0, 0, 0, // fst lenght
+                0, 0, 0, 0, 0, 0, 0, 0, // fst length
                 16, 0, 0, 0, 0, 0, 0, 0, // index start offset
                 3, 0, 0, 0, 0, 0, 0, 0, // num term
                 3, 0, 0, 0, // version

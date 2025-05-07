@@ -93,6 +93,7 @@ impl TermInfoBlockMeta {
     }
 }
 
+#[derive(Clone)]
 pub struct TermInfoStore {
     num_terms: usize,
     block_meta_bytes: OwnedBytes,
@@ -288,7 +289,6 @@ impl TermInfoStoreWriter {
 #[cfg(test)]
 mod tests {
 
-    use common;
     use common::BinarySerializable;
     use tantivy_bitpacker::{compute_num_bits, BitPacker};
 

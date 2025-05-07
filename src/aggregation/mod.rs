@@ -44,11 +44,14 @@
 //! - [Metric](metric)
 //!     - [Average](metric::AverageAggregation)
 //!     - [Stats](metric::StatsAggregation)
+//!     - [ExtendedStats](metric::ExtendedStatsAggregation)
 //!     - [Min](metric::MinAggregation)
 //!     - [Max](metric::MaxAggregation)
 //!     - [Sum](metric::SumAggregation)
 //!     - [Count](metric::CountAggregation)
 //!     - [Percentiles](metric::PercentilesAggregationReq)
+//!     - [Cardinality](metric::CardinalityAggregationReq)
+//!     - [TopHits](metric::TopHitsAggregationReq)
 //!
 //! # Example
 //! Compute the average metric, by building [`agg_req::Aggregations`], which is built from an
@@ -143,9 +146,9 @@ use std::fmt::Display;
 #[cfg(test)]
 mod agg_tests;
 
-mod agg_bench;
+use core::fmt;
 
-pub use agg_limits::AggregationLimits;
+pub use agg_limits::AggregationLimitsGuard;
 pub use collector::{
     AggregationCollector, AggregationSegmentCollector, DistributedAggregationCollector,
     DEFAULT_BUCKET_LIMIT,
@@ -154,7 +157,105 @@ use columnar::{ColumnType, MonotonicallyMappableToU64};
 pub(crate) use date::format_date;
 pub use error::AggregationError;
 use itertools::Itertools;
-use serde::{Deserialize, Serialize};
+use serde::de::{self, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+
+fn parse_str_into_f64<E: de::Error>(value: &str) -> Result<f64, E> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|_err| de::Error::custom(format!("Failed to parse f64 from string: {value:?}")))?;
+
+    // Check if the parsed value is NaN or infinity
+    if parsed.is_nan() || parsed.is_infinite() {
+        Err(de::Error::custom(format!(
+            "Value is not a valid f64 (NaN or Infinity): {value:?}"
+        )))
+    } else {
+        Ok(parsed)
+    }
+}
+
+/// deserialize Option<f64> from string or float
+pub(crate) fn deserialize_option_f64<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where D: Deserializer<'de> {
+    struct StringOrFloatVisitor;
+
+    impl Visitor<'_> for StringOrFloatVisitor {
+        type Value = Option<f64>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a float")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where E: de::Error {
+            parse_str_into_f64(value).map(Some)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value))
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value as f64))
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(Some(value as f64))
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(None)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrFloatVisitor)
+}
+
+/// deserialize f64 from string or float
+pub(crate) fn deserialize_f64<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where D: Deserializer<'de> {
+    struct StringOrFloatVisitor;
+
+    impl Visitor<'_> for StringOrFloatVisitor {
+        type Value = f64;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or a float")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where E: de::Error {
+            parse_str_into_f64(value)
+        }
+
+        fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value)
+        }
+
+        fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value as f64)
+        }
+
+        fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+        where E: de::Error {
+            Ok(value as f64)
+        }
+    }
+
+    deserializer.deserialize_any(StringOrFloatVisitor)
+}
 
 /// Represents an associative array `(key => values)` in a very efficient manner.
 #[derive(PartialEq, Serialize, Deserialize)]
@@ -235,10 +336,16 @@ pub type SerializedKey = String;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialOrd)]
 /// The key to identify a bucket.
+///
+/// The order is important, with serde untagged, that we try to deserialize into i64 first.
 #[serde(untagged)]
 pub enum Key {
     /// String key
     Str(String),
+    /// `i64` key
+    I64(i64),
+    /// `u64` key
+    U64(u64),
     /// `f64` key
     F64(f64),
 }
@@ -249,6 +356,8 @@ impl std::hash::Hash for Key {
         match self {
             Key::Str(text) => text.hash(state),
             Key::F64(val) => val.to_bits().hash(state),
+            Key::U64(val) => val.hash(state),
+            Key::I64(val) => val.hash(state),
         }
     }
 }
@@ -257,8 +366,12 @@ impl PartialEq for Key {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Str(l), Self::Str(r)) => l == r,
-            (Self::F64(l), Self::F64(r)) => l == r,
-            _ => false,
+            (Self::F64(l), Self::F64(r)) => l.to_bits() == r.to_bits(),
+            (Self::I64(l), Self::I64(r)) => l == r,
+            (Self::U64(l), Self::U64(r)) => l == r,
+            // we list all variant of left operand to make sure this gets updated when we add
+            // variants to the enum
+            (Self::Str(_) | Self::F64(_) | Self::I64(_) | Self::U64(_), _) => false,
         }
     }
 }
@@ -268,6 +381,8 @@ impl Display for Key {
         match self {
             Key::Str(val) => f.write_str(val),
             Key::F64(val) => f.write_str(&val.to_string()),
+            Key::U64(val) => f.write_str(&val.to_string()),
+            Key::I64(val) => f.write_str(&val.to_string()),
         }
     }
 }
@@ -281,6 +396,7 @@ pub(crate) fn f64_from_fastfield_u64(val: u64, field_type: &ColumnType) -> f64 {
         ColumnType::U64 => val as f64,
         ColumnType::I64 | ColumnType::DateTime => i64::from_u64(val) as f64,
         ColumnType::F64 => f64::from_u64(val),
+        ColumnType::Bool => val as f64,
         _ => {
             panic!("unexpected type {field_type:?}. This should not happen")
         }
@@ -301,6 +417,7 @@ pub(crate) fn f64_to_fastfield_u64(val: f64, field_type: &ColumnType) -> Option<
         ColumnType::U64 => Some(val as u64),
         ColumnType::I64 | ColumnType::DateTime => Some((val as i64).to_u64()),
         ColumnType::F64 => Some(val.to_u64()),
+        ColumnType::Bool => Some(val as u64),
         _ => None,
     }
 }
@@ -314,7 +431,6 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::agg_req::Aggregations;
-    use super::segment_agg_result::AggregationLimits;
     use super::*;
     use crate::indexer::NoMergePolicy;
     use crate::query::{AllQuery, TermQuery};
@@ -346,7 +462,7 @@ mod tests {
         agg_req: Aggregations,
         index: &Index,
         query: Option<(&str, &str)>,
-        limits: AggregationLimits,
+        limits: AggregationLimitsGuard,
     ) -> crate::Result<Value> {
         let collector = AggregationCollector::from_aggs(agg_req, limits);
 
@@ -466,7 +582,7 @@ mod tests {
             .set_indexing_options(
                 TextFieldIndexing::default().set_index_option(IndexRecordOption::WithFreqs),
             )
-            .set_fast(None)
+            .set_fast(Some("raw"))
             .set_stored();
         let text_field = schema_builder.add_text_field("text", text_fieldtype);
         let date_field = schema_builder.add_date_field("date", FAST);

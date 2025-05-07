@@ -1,5 +1,4 @@
-use proptest::prelude::{any, prop, *};
-use proptest::strategy::Strategy;
+use proptest::prelude::*;
 use proptest::{prop_oneof, proptest};
 
 use super::*;
@@ -16,9 +15,7 @@ fn test_optional_index_with_num_docs(num_docs: u32) {
     let mut dataframe_writer = ColumnarWriter::default();
     dataframe_writer.record_numerical(100, "score", 80i64);
     let mut buffer: Vec<u8> = Vec::new();
-    dataframe_writer
-        .serialize(num_docs, None, &mut buffer)
-        .unwrap();
+    dataframe_writer.serialize(num_docs, &mut buffer).unwrap();
     let columnar = ColumnarReader::open(buffer).unwrap();
     assert_eq!(columnar.num_columns(), 1);
     let cols: Vec<DynamicColumnHandle> = columnar.read_columns("score").unwrap();
@@ -113,8 +110,8 @@ fn test_null_index(data: &[bool]) {
         .map(|(pos, _val)| pos as u32)
         .collect();
     let mut select_iter = null_index.select_cursor();
-    for i in 0..orig_idx_with_value.len() {
-        assert_eq!(select_iter.select(i as u32), orig_idx_with_value[i]);
+    for (i, expected) in orig_idx_with_value.iter().enumerate() {
+        assert_eq!(select_iter.select(i as u32), *expected);
     }
 
     let step_size = (orig_idx_with_value.len() / 100).max(1);
@@ -167,7 +164,7 @@ fn test_optional_index_large() {
 fn test_optional_index_iter_aux(row_ids: &[RowId], num_rows: RowId) {
     let optional_index = OptionalIndex::for_test(num_rows, row_ids);
     assert_eq!(optional_index.num_docs(), num_rows);
-    assert!(optional_index.iter_rows().eq(row_ids.iter().copied()));
+    assert!(optional_index.iter_docs().eq(row_ids.iter().copied()));
 }
 
 #[test]
@@ -257,11 +254,7 @@ mod bench {
         let mut current = start;
         std::iter::from_fn(move || {
             current += rng.gen_range(avg_step_size - avg_deviation..=avg_step_size + avg_deviation);
-            if current >= end {
-                None
-            } else {
-                Some(current)
-            }
+            if current >= end { None } else { Some(current) }
         })
     }
 

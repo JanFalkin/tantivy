@@ -1,4 +1,3 @@
-use std::convert::TryInto;
 use std::ops::{Deref, Range};
 use std::sync::Arc;
 use std::{fmt, io};
@@ -152,7 +151,7 @@ impl fmt::Debug for OwnedBytes {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // We truncate the bytes in order to make sure the debug string
         // is not too long.
-        let bytes_truncated: &[u8] = if self.len() > 8 {
+        let bytes_truncated: &[u8] = if self.len() > 10 {
             &self.as_slice()[..10]
         } else {
             self.as_slice()
@@ -252,6 +251,11 @@ mod tests {
         assert_eq!(
             format!("{short_bytes:?}"),
             "OwnedBytes([97, 98, 99, 100], len=4)"
+        );
+        let medium_bytes = OwnedBytes::new(b"abcdefghi".as_ref());
+        assert_eq!(
+            format!("{medium_bytes:?}"),
+            "OwnedBytes([97, 98, 99, 100, 101, 102, 103, 104, 105], len=9)"
         );
         let long_bytes = OwnedBytes::new(b"abcdefghijklmnopq".as_ref());
         assert_eq!(

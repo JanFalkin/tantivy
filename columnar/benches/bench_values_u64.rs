@@ -5,21 +5,13 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use rand::prelude::*;
-use tantivy_columnar::column_values::{serialize_and_load_u64_based_column_values, CodecType};
+use tantivy_columnar::column_values::{CodecType, serialize_and_load_u64_based_column_values};
 use tantivy_columnar::*;
 use test::Bencher;
 
 // Warning: this generates the same permutation at each call
 fn generate_permutation() -> Vec<u64> {
     let mut permutation: Vec<u64> = (0u64..100_000u64).collect();
-    permutation.shuffle(&mut StdRng::from_seed([1u8; 32]));
-    permutation
-}
-
-fn generate_random() -> Vec<u64> {
-    let mut permutation: Vec<u64> = (0u64..100_000u64)
-        .map(|el| el + random::<u16>() as u64)
-        .collect();
     permutation.shuffle(&mut StdRng::from_seed([1u8; 32]));
     permutation
 }

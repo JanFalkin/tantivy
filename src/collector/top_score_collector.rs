@@ -3,7 +3,6 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use columnar::ColumnValues;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use super::Collector;
@@ -719,8 +718,12 @@ impl SegmentCollector for TopScoreSegmentCollector {
 
 /// Fast TopN Computation
 ///
+/// Capacity of the vec is 2 * top_n.
+/// The buffer is truncated to the top_n elements when it reaches the capacity of the Vec.
+/// That means capacity has special meaning and should be carried over when cloning or serializing.
+///
 /// For TopN == 0, it will be relative expensive.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(from = "TopNComputerDeser<Score, D, REVERSE_ORDER>")]
 pub struct TopNComputer<Score, D, const REVERSE_ORDER: bool = true> {
     /// The buffer reverses sort order to get top-semantics instead of bottom-semantics
@@ -728,12 +731,41 @@ pub struct TopNComputer<Score, D, const REVERSE_ORDER: bool = true> {
     top_n: usize,
     pub(crate) threshold: Option<Score>,
 }
-// Intermediate struct for TopNComputer for deserialization, to fix vec capacity
+
+impl<Score: std::fmt::Debug, D, const REVERSE_ORDER: bool> std::fmt::Debug
+    for TopNComputer<Score, D, REVERSE_ORDER>
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TopNComputer")
+            .field("buffer_len", &self.buffer.len())
+            .field("top_n", &self.top_n)
+            .field("current_threshold", &self.threshold)
+            .finish()
+    }
+}
+
+// Intermediate struct for TopNComputer for deserialization, to keep vec capacity
 #[derive(Deserialize)]
 struct TopNComputerDeser<Score, D, const REVERSE_ORDER: bool> {
     buffer: Vec<ComparableDoc<Score, D, REVERSE_ORDER>>,
     top_n: usize,
     threshold: Option<Score>,
+}
+
+// Custom clone to keep capacity
+impl<Score: Clone, D: Clone, const REVERSE_ORDER: bool> Clone
+    for TopNComputer<Score, D, REVERSE_ORDER>
+{
+    fn clone(&self) -> Self {
+        let mut buffer_clone = Vec::with_capacity(self.buffer.capacity());
+        buffer_clone.extend(self.buffer.iter().cloned());
+
+        TopNComputer {
+            buffer: buffer_clone,
+            top_n: self.top_n,
+            threshold: self.threshold.clone(),
+        }
+    }
 }
 
 impl<Score, D, const R: bool> From<TopNComputerDeser<Score, D, R>> for TopNComputer<Score, D, R> {
@@ -757,7 +789,7 @@ impl<Score, D, const R: bool> From<TopNComputerDeser<Score, D, R>> for TopNCompu
 impl<Score, D, const R: bool> TopNComputer<Score, D, R>
 where
     Score: PartialOrd + Clone,
-    D: Serialize + DeserializeOwned + Ord + Clone,
+    D: Ord,
 {
     /// Create a new `TopNComputer`.
     /// Internally it will allocate a buffer of size `2 * top_n`.
@@ -838,7 +870,10 @@ mod tests {
     use crate::schema::{Field, Schema, FAST, STORED, TEXT};
     use crate::time::format_description::well_known::Rfc3339;
     use crate::time::OffsetDateTime;
-    use crate::{DateTime, DocAddress, DocId, Index, IndexWriter, Order, Score, SegmentReader};
+    use crate::{
+        assert_nearly_equals, DateTime, DocAddress, DocId, Index, IndexWriter, Order, Score,
+        SegmentReader,
+    };
 
     fn make_index() -> crate::Result<Index> {
         let mut schema_builder = Schema::builder();

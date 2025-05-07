@@ -1,8 +1,5 @@
 use std::cmp::Ordering;
-use std::fmt::Display;
 
-use columnar::ColumnType;
-use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use tantivy_bitpacker::minmax;
@@ -18,9 +15,9 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateHistogramBucketEntry,
 };
 use crate::aggregation::segment_agg_result::{
-    build_segment_agg_collector, AggregationLimits, SegmentAggregationCollector,
+    build_segment_agg_collector, SegmentAggregationCollector,
 };
-use crate::aggregation::{f64_from_fastfield_u64, format_date};
+use crate::aggregation::*;
 use crate::TantivyError;
 
 /// Histogram is a bucket aggregation, where buckets are created dynamically for given `interval`.
@@ -73,6 +70,7 @@ pub struct HistogramAggregation {
     pub field: String,
     /// The interval to chunk your data range. Each bucket spans a value range of [0..interval).
     /// Must be a positive value.
+    #[serde(deserialize_with = "deserialize_f64")]
     pub interval: f64,
     /// Intervals implicitly defines an absolute grid of buckets `[interval * k, interval * (k +
     /// 1))`.
@@ -85,6 +83,7 @@ pub struct HistogramAggregation {
     /// fall into the buckets with the key 0 and 10.
     /// With offset 5 and interval 10, they would both fall into the bucket with they key 5 and the
     /// range [5..15)
+    #[serde(default, deserialize_with = "deserialize_option_f64")]
     pub offset: Option<f64>,
     /// The minimum number of documents in a bucket to be returned. Defaults to 0.
     pub min_doc_count: Option<u64>,
@@ -308,7 +307,10 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
             .column_block_accessor
             .fetch_block(docs, &bucket_agg_accessor.accessor);
 
-        for (doc, val) in bucket_agg_accessor.column_block_accessor.iter_docid_vals() {
+        for (doc, val) in bucket_agg_accessor
+            .column_block_accessor
+            .iter_docid_vals(docs, &bucket_agg_accessor.accessor)
+        {
             let val = self.f64_from_fastfield_u64(val);
 
             let bucket_pos = get_bucket_pos(val);
@@ -329,9 +331,11 @@ impl SegmentAggregationCollector for SegmentHistogramCollector {
         }
 
         let mem_delta = self.get_memory_consumption() - mem_pre;
-        bucket_agg_accessor
-            .limits
-            .add_memory_consumed(mem_delta as u64)?;
+        if mem_delta > 0 {
+            bucket_agg_accessor
+                .limits
+                .add_memory_consumed(mem_delta as u64)?;
+        }
 
         Ok(())
     }
@@ -434,7 +438,7 @@ fn intermediate_buckets_to_final_buckets_fill_gaps(
     buckets: Vec<IntermediateHistogramBucketEntry>,
     histogram_req: &HistogramAggregation,
     sub_aggregation: &Aggregations,
-    limits: &AggregationLimits,
+    limits: &mut AggregationLimitsGuard,
 ) -> crate::Result<Vec<BucketEntry>> {
     // Generate the full list of buckets without gaps.
     //
@@ -492,7 +496,7 @@ pub(crate) fn intermediate_histogram_buckets_to_final_buckets(
     is_date_agg: bool,
     histogram_req: &HistogramAggregation,
     sub_aggregation: &Aggregations,
-    limits: &AggregationLimits,
+    limits: &mut AggregationLimitsGuard,
 ) -> crate::Result<Vec<BucketEntry>> {
     // Normalization is column type dependent.
     // The request used in the the call to final is not yet be normalized.
@@ -595,13 +599,11 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::aggregation::agg_req::Aggregations;
     use crate::aggregation::agg_result::AggregationResults;
     use crate::aggregation::tests::{
         exec_request, exec_request_with_query, exec_request_with_query_and_memory_limit,
         get_test_index_2_segments, get_test_index_from_values, get_test_index_with_num_docs,
     };
-    use crate::aggregation::AggregationCollector;
     use crate::query::AllQuery;
 
     #[test]
@@ -748,7 +750,7 @@ mod tests {
             agg_req,
             &index,
             None,
-            AggregationLimits::new(Some(5_000), None),
+            AggregationLimitsGuard::new(Some(5_000), None),
         )
         .unwrap_err();
         assert!(res.to_string().starts_with(

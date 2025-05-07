@@ -25,6 +25,7 @@ where W: Write
 
     /// Attempts to serialize a given document and write the output
     /// to the writer.
+    #[inline]
     pub(crate) fn serialize_doc<D>(&mut self, doc: &D) -> io::Result<()>
     where D: Document {
         let stored_field_values = || {
@@ -57,9 +58,8 @@ where W: Write
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "Unexpected number of entries written to serializer, expected {} entries, got \
-                     {} entries",
-                    num_field_values, actual_length,
+                    "Unexpected number of entries written to serializer, expected \
+                     {num_field_values} entries, got {actual_length} entries",
                 ),
             ));
         }
@@ -81,6 +81,15 @@ where W: Write
         Self { writer }
     }
 
+    fn serialize_with_type_code<T: BinarySerializable>(
+        &mut self,
+        code: u8,
+        val: &T,
+    ) -> io::Result<()> {
+        self.write_type_code(code)?;
+        BinarySerializable::serialize(val, self.writer)
+    }
+
     /// Attempts to serialize a given value and write the output
     /// to the writer.
     pub(crate) fn serialize_value<'a, V>(
@@ -94,56 +103,38 @@ where W: Write
             ReferenceValue::Leaf(leaf) => match leaf {
                 ReferenceValueLeaf::Null => self.write_type_code(type_codes::NULL_CODE),
                 ReferenceValueLeaf::Str(val) => {
-                    self.write_type_code(type_codes::TEXT_CODE)?;
-
-                    let temp_val = Cow::Borrowed(val);
-                    temp_val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::TEXT_CODE, &Cow::Borrowed(val))
                 }
                 ReferenceValueLeaf::U64(val) => {
-                    self.write_type_code(type_codes::U64_CODE)?;
-
-                    val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::U64_CODE, &val)
                 }
                 ReferenceValueLeaf::I64(val) => {
-                    self.write_type_code(type_codes::I64_CODE)?;
-
-                    val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::I64_CODE, &val)
                 }
                 ReferenceValueLeaf::F64(val) => {
-                    self.write_type_code(type_codes::F64_CODE)?;
-
-                    f64_to_u64(val).serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::F64_CODE, &f64_to_u64(val))
                 }
                 ReferenceValueLeaf::Date(val) => {
                     self.write_type_code(type_codes::DATE_CODE)?;
-                    val.serialize(self.writer)
+                    let timestamp_nanos: i64 = val.into_timestamp_nanos();
+                    BinarySerializable::serialize(&timestamp_nanos, self.writer)
                 }
-                ReferenceValueLeaf::Facet(val) => {
-                    self.write_type_code(type_codes::HIERARCHICAL_FACET_CODE)?;
-
-                    val.serialize(self.writer)
-                }
+                ReferenceValueLeaf::Facet(val) => self.serialize_with_type_code(
+                    type_codes::HIERARCHICAL_FACET_CODE,
+                    &Cow::Borrowed(val),
+                ),
                 ReferenceValueLeaf::Bytes(val) => {
-                    self.write_type_code(type_codes::BYTES_CODE)?;
-
-                    let temp_val = Cow::Borrowed(val);
-                    temp_val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::BYTES_CODE, &Cow::Borrowed(val))
                 }
                 ReferenceValueLeaf::IpAddr(val) => {
-                    self.write_type_code(type_codes::IP_CODE)?;
-
-                    val.to_u128().serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::IP_CODE, &val.to_u128())
                 }
                 ReferenceValueLeaf::Bool(val) => {
-                    self.write_type_code(type_codes::BOOL_CODE)?;
-
-                    val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::BOOL_CODE, &val)
                 }
                 ReferenceValueLeaf::PreTokStr(val) => {
                     self.write_type_code(type_codes::EXT_CODE)?;
-                    self.write_type_code(type_codes::TOK_STR_EXT_CODE)?;
-
-                    val.serialize(self.writer)
+                    self.serialize_with_type_code(type_codes::TOK_STR_EXT_CODE, &*val)
                 }
             },
             ReferenceValue::Array(elements) => {
@@ -306,7 +297,6 @@ where W: Write
 mod tests {
     use std::collections::BTreeMap;
 
-    use common::DateTime;
     use serde_json::Number;
     use tokenizer_api::Token;
 
@@ -337,7 +327,10 @@ mod tests {
                     $ext_code.serialize(&mut writer).unwrap();
                 )?
 
-                $value.serialize(&mut writer).unwrap();
+                BinarySerializable::serialize(
+                    &$value,
+                    &mut writer,
+                ).unwrap();
             )*
 
             writer
@@ -355,7 +348,10 @@ mod tests {
                     $ext_code.serialize(&mut writer).unwrap();
                 )?
 
-                $value.serialize(&mut writer).unwrap();
+                BinarySerializable::serialize(
+                    &$value,
+                    &mut writer,
+                ).unwrap();
             )*
 
             writer
@@ -418,17 +414,8 @@ mod tests {
             "Expected serialized value to match the binary representation"
         );
 
-        let result = serialize_value(ReferenceValueLeaf::Date(DateTime::MAX).into());
-        let expected = binary_repr!(
-            type_codes::DATE_CODE => DateTime::MAX,
-        );
-        assert_eq!(
-            result, expected,
-            "Expected serialized value to match the binary representation"
-        );
-
         let facet = Facet::from_text("/hello/world").unwrap();
-        let result = serialize_value(ReferenceValueLeaf::Facet(&facet).into());
+        let result = serialize_value(ReferenceValueLeaf::Facet(facet.encoded_str()).into());
         let expected = binary_repr!(
             type_codes::HIERARCHICAL_FACET_CODE => Facet::from_text("/hello/world").unwrap(),
         );
@@ -441,7 +428,8 @@ mod tests {
             text: "hello, world".to_string(),
             tokens: vec![Token::default(), Token::default()],
         };
-        let result = serialize_value(ReferenceValueLeaf::PreTokStr(&pre_tok_str).into());
+        let result =
+            serialize_value(ReferenceValueLeaf::PreTokStr(pre_tok_str.clone().into()).into());
         let expected = binary_repr!(
             type_codes::EXT_CODE, type_codes::TOK_STR_EXT_CODE => pre_tok_str,
         );
@@ -453,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_array_serialize() {
-        let elements = vec![serde_json::Value::Null, serde_json::Value::Null];
+        let elements = [serde_json::Value::Null, serde_json::Value::Null];
         let result = serialize_value(ReferenceValue::Array(elements.iter()));
         let expected = binary_repr!(
             collection type_codes::ARRAY_CODE,
@@ -466,7 +454,7 @@ mod tests {
             "Expected serialized value to match the binary representation"
         );
 
-        let elements = vec![
+        let elements = [
             serde_json::Value::String("Hello, world".into()),
             serde_json::Value::String("Some demo".into()),
         ];
@@ -482,7 +470,7 @@ mod tests {
             "Expected serialized value to match the binary representation"
         );
 
-        let elements = vec![];
+        let elements = [];
         let result = serialize_value(ReferenceValue::Array(elements.iter()));
         let expected = binary_repr!(
             collection type_codes::ARRAY_CODE,
@@ -493,7 +481,7 @@ mod tests {
             "Expected serialized value to match the binary representation"
         );
 
-        let elements = vec![
+        let elements = [
             serde_json::Value::Null,
             serde_json::Value::String("Hello, world".into()),
             serde_json::Value::Number(12345.into()),
@@ -678,6 +666,7 @@ mod tests {
         );
     }
 
+    #[inline]
     fn serialize_doc<D: Document>(doc: &D, schema: &Schema) -> Vec<u8> {
         let mut writer = Vec::new();
 

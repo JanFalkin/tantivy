@@ -1,13 +1,13 @@
 use std::io;
 
 use common::{BinarySerializable, OwnedBytes};
-use tantivy_bitpacker::{compute_num_bits, BitPacker, BitUnpacker};
+use tantivy_bitpacker::{BitPacker, BitUnpacker, compute_num_bits};
 
-use super::line::Line;
 use super::ColumnValues;
-use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
-use crate::column_values::VecColumn;
+use super::line::Line;
 use crate::RowId;
+use crate::column_values::VecColumn;
+use crate::column_values::u64_based::{ColumnCodec, ColumnCodecEstimator, ColumnStats};
 
 const HALF_SPACE: u64 = u64::MAX / 2;
 const LINE_ESTIMATION_BLOCK_LEN: usize = 512;
@@ -173,7 +173,9 @@ impl LinearCodecEstimator {
     fn collect_before_line_estimation(&mut self, value: u64) {
         self.block.push(value);
         if self.block.len() == LINE_ESTIMATION_BLOCK_LEN {
-            let line = Line::train(&VecColumn::from(&self.block));
+            let column = VecColumn::from(std::mem::take(&mut self.block));
+            let line = Line::train(&column);
+            self.block = column.into();
             let block = std::mem::take(&mut self.block);
             for val in block {
                 self.collect_after_line_estimation(&line, val);
